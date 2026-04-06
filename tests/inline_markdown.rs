@@ -66,6 +66,55 @@ fn bare_url_still_formats_after_whitespace_or_at_start() {
 }
 
 #[test]
+fn nested_stash_does_not_leak_placeholder_markers() {
+    // `apply_escapes` stashes backslash escapes first, then `code_span_re`
+    // stashes the wrapping code span whose value contains the inner escape
+    // placeholder keys. `restore_placeholders` used to iterate forward, so by
+    // the time it expanded the outer code-span placeholder, it had already
+    // moved past the inner escape placeholders and never re-visited them.
+    // The result: literal `\u{0}MDSTREAM0\u{0}` markers in the output, which
+    // most terminals display as the visible ASCII `MDSTREAM0`.
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+
+    let rendered = renderer.render_line("`\\| h \\|`\n");
+
+    assert!(
+        !rendered.contains('\u{0}'),
+        "NUL-bracketed placeholder key leaked into output: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("MDSTREAM"),
+        "literal MDSTREAM marker leaked into output: {rendered:?}"
+    );
+    assert_eq!(strip_ansi(&rendered), "| h |\n");
+}
+
+#[test]
+fn nested_stash_survives_link_with_bold_code_escape() {
+    // Stress four levels of stashing: a link whose label contains bold which
+    // contains a code span which contains an escaped pipe.
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+
+    let rendered = renderer.render_line("[**`\\|`**](https://example.com)\n");
+
+    assert!(
+        !rendered.contains('\u{0}'),
+        "placeholder key leaked: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("MDSTREAM"),
+        "literal MDSTREAM marker leaked: {rendered:?}"
+    );
+    // The link label should still contain the resolved pipe character.
+    let plain = strip_ansi(&rendered);
+    assert!(
+        plain.contains('|'),
+        "pipe lost during nested stash resolution: {plain:?}"
+    );
+    assert!(plain.contains("https://example.com"), "URL lost: {plain:?}");
+}
+
+#[test]
 fn renders_links_images_and_escapes() {
     let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
 

@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod renderer;
+pub mod theme;
 
 use anyhow::Result;
 use std::io::{self, IsTerminal, Write};
@@ -24,8 +25,13 @@ pub fn run(cli: cli::Cli) -> Result<()> {
     let mut stderr = io::stderr().lock();
     handle_tty_check(is_tty, &mut stderr)?;
 
-    let mut renderer =
-        renderer::StreamingMarkdownRenderer::new(cli.padding, !cli.no_lineno, !cli.no_list_guides);
+    let mut renderer = renderer::StreamingMarkdownRenderer::with_code_theme(
+        cli.padding,
+        !cli.no_lineno,
+        !cli.no_list_guides,
+        cli.theme,
+        !cli.no_code_background,
+    );
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
 
@@ -69,6 +75,20 @@ pub fn handle_tty_check<W: Write>(is_tty: bool, stderr: &mut W) -> Result<()> {
         stderr,
         "  MDSTREAM_NO_LIST_GUIDES  Disable vertical indent guides for nested lists"
     )?;
+    writeln!(
+        stderr,
+        "  MDSTREAM_THEME           Syntect theme for fenced code blocks"
+    )?;
+    writeln!(
+        stderr,
+        "  MDSTREAM_NO_CODE_BACKGROUND  Disable themed code-block backgrounds"
+    )?;
+    writeln!(stderr)?;
+    writeln!(
+        stderr,
+        "Themes: {}",
+        crate::theme::CodeTheme::all_names_csv()
+    )?;
     Err(StdinIsTerminal.into())
 }
 
@@ -100,5 +120,8 @@ mod tests {
         assert!(banner.contains("MDSTREAM_PADDING"));
         assert!(banner.contains("MDSTREAM_NO_LINENO"));
         assert!(banner.contains("MDSTREAM_NO_LIST_GUIDES"));
+        assert!(banner.contains("MDSTREAM_THEME"));
+        assert!(banner.contains("MDSTREAM_NO_CODE_BACKGROUND"));
+        assert!(banner.contains("base16-ocean-dark"));
     }
 }

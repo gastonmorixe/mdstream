@@ -82,3 +82,41 @@ fn binary_respects_no_lineno_env() {
     assert!(!stdout.contains("  1  "));
     assert!(stdout.contains("print('hello')"));
 }
+
+#[test]
+fn help_lists_theme_flag_and_values() {
+    let output = Command::new(env!("CARGO_BIN_EXE_mdstream"))
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--theme <THEME>"));
+    assert!(stdout.contains("base16-ocean-dark"));
+    assert!(stdout.contains("solarized-dark"));
+    assert!(stdout.contains("--no-code-background"));
+}
+
+#[test]
+fn binary_rejects_invalid_theme_value_and_lists_choices() {
+    let output = Command::new(env!("CARGO_BIN_EXE_mdstream"))
+        .arg("--theme")
+        .arg("nope")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("invalid value"));
+    assert!(stderr.contains("possible values"));
+    assert!(stderr.contains("base16-ocean-dark"));
+    assert!(stderr.contains("inspired-github"));
+}

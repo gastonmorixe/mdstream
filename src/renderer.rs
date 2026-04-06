@@ -1,3 +1,4 @@
+use crate::theme::{CodeTheme, DEFAULT_CODE_THEME};
 use anyhow::Result;
 use crossterm::terminal;
 use regex::Regex;
@@ -175,10 +176,10 @@ impl SyntectAssets {
         }
     }
 
-    fn theme(&self) -> &Theme {
+    fn theme(&self, code_theme: CodeTheme) -> &Theme {
         self.theme_set
             .themes
-            .get("base16-ocean.dark")
+            .get(code_theme.syntect_name())
             .or_else(|| self.theme_set.themes.values().next())
             .expect("syntect default themes should not be empty")
     }
@@ -318,7 +319,17 @@ fn stash_placeholder(value: String, placeholders: &mut Vec<String>) -> String {
 }
 
 fn restore_placeholders(mut text: String, placeholders: &[String]) -> String {
-    for (index, value) in placeholders.iter().enumerate() {
+    // Iterate highest-index first. Outer stashes (code span, link, image,
+    // ...) always carry larger indices than the inner stashes they enclose,
+    // because `stash_placeholder` uses `placeholders.len()` at the moment of
+    // stashing. Reversing the loop guarantees we expand the outer
+    // placeholder first, which injects inner keys back into `text`, and the
+    // subsequent inner substitutions then resolve them in the same pass. A
+    // forward loop would expand the outer placeholder only after the loop
+    // had moved past the inner indices, leaving literal `\u{0}MDSTREAMn\u{0}`
+    // markers in the output (visible as `MDSTREAMn` on terminals that drop
+    // NUL bytes).
+    for (index, value) in placeholders.iter().enumerate().rev() {
         let key = format!("\u{0}MDSTREAM{}\u{0}", index);
         text = text.replace(&key, value);
     }
@@ -448,6 +459,8 @@ pub struct StreamingMarkdownRenderer {
     code_lang: String,
     code_line_num: usize,
     show_lineno: bool,
+    code_theme: CodeTheme,
+    show_code_background: bool,
     code_highlighter: Option<HighlightLines<'static>>,
     pending_table_header: Option<String>,
     pending_table_rows: usize,
@@ -489,6 +502,22 @@ struct ListContext {
 
 impl StreamingMarkdownRenderer {
     pub fn new(padding: usize, show_lineno: bool, show_list_guides: bool) -> Self {
+        Self::with_code_theme(
+            padding,
+            show_lineno,
+            show_list_guides,
+            DEFAULT_CODE_THEME,
+            true,
+        )
+    }
+
+    pub fn with_code_theme(
+        padding: usize,
+        show_lineno: bool,
+        show_list_guides: bool,
+        code_theme: CodeTheme,
+        show_code_background: bool,
+    ) -> Self {
         Self {
             partial: String::new(),
             pad: " ".repeat(padding),
@@ -497,6 +526,8 @@ impl StreamingMarkdownRenderer {
             code_lang: String::new(),
             code_line_num: 0,
             show_lineno,
+            code_theme,
+            show_code_background,
             code_highlighter: None,
             pending_table_header: None,
             pending_table_rows: 0,
@@ -518,7 +549,18 @@ impl StreamingMarkdownRenderer {
             .unwrap_or(0);
         let show_lineno = std::env::var("MDSTREAM_NO_LINENO").is_err();
         let show_list_guides = std::env::var("MDSTREAM_NO_LIST_GUIDES").is_err();
-        Self::new(padding, show_lineno, show_list_guides)
+        let code_theme = std::env::var("MDSTREAM_THEME")
+            .ok()
+            .and_then(|value| CodeTheme::parse(&value).ok())
+            .unwrap_or(DEFAULT_CODE_THEME);
+        let show_code_background = std::env::var("MDSTREAM_NO_CODE_BACKGROUND").is_err();
+        Self::with_code_theme(
+            padding,
+            show_lineno,
+            show_list_guides,
+            code_theme,
+            show_code_background,
+        )
     }
 
     pub fn render_line(&mut self, line: &str) -> String {
@@ -785,7 +827,10 @@ impl StreamingMarkdownRenderer {
                 .to_owned();
             self.in_code_block = true;
             self.code_line_num = 0;
-            self.code_highlighter = Some(Self::make_code_highlighter(&self.code_lang));
+            self.code_highlighter = Some(Self::make_code_highlighter(
+                &self.code_lang,
+                self.code_theme,
+            ));
 
             if self.code_lang.is_empty() {
                 return format!("{}{}{}{}\n", self.pad, DIM, "─".repeat(40), RESET);
@@ -814,13 +859,13 @@ impl StreamingMarkdownRenderer {
         format!("{}{}{}{}\n", self.pad, DIM, "─".repeat(40), RESET)
     }
 
-    fn make_code_highlighter(lang: &str) -> HighlightLines<'static> {
+    fn make_code_highlighter(lang: &str, code_theme: CodeTheme) -> HighlightLines<'static> {
         let assets = syntect_assets();
         let syntax = assets
             .syntax_set
             .find_syntax_by_token(lang)
             .unwrap_or_else(|| assets.syntax_set.find_syntax_plain_text());
-        HighlightLines::new(syntax, assets.theme())
+        HighlightLines::new(syntax, assets.theme(code_theme))
     }
 
     fn render_code_line(&mut self, stripped: &str) -> String {
@@ -837,7 +882,7 @@ impl StreamingMarkdownRenderer {
             .highlight_line(&line, &syntect_assets().syntax_set)
             .expect("syntect highlighting should not fail");
 
-        let escaped = as_24_bit_terminal_escaped(&highlighted, false);
+        let escaped = as_24_bit_terminal_escaped(&highlighted, self.show_code_background);
         if self.show_lineno {
             return format!(
                 "{}{}{:>3}  {}{}{}\n",
@@ -1130,5 +1175,55 @@ impl StreamingMarkdownRenderer {
     #[doc(hidden)]
     pub fn set_term_width_override_for_tests(&mut self, width: usize) {
         self.term_width_override = Some(width);
+    }
+}
+
+#[cfg(test)]
+mod visible_width_tests {
+    use super::*;
+
+    #[test]
+    fn ascii_string_width_matches_char_count() {
+        assert_eq!(visible_width("plain ascii"), 11);
+        assert_eq!(visible_width(""), 0);
+        assert_eq!(visible_width("a"), 1);
+    }
+
+    #[test]
+    fn cjk_string_width_is_double_char_count() {
+        // Each CJK character has East Asian Width = Wide = 2 cells.
+        assert_eq!(visible_width("日本語"), 6);
+    }
+
+    #[test]
+    fn single_flag_is_two_cells() {
+        // Regional indicator pair (U+1F1FA + U+1F1F8 = 🇺🇸) forms a flag
+        // emoji. Standards-compliant terminals render it as a single 2-cell
+        // glyph; fonts without flag ligatures typically show two narrow
+        // tofu boxes that still land at ~2 cells total. Counting 2 matches
+        // both rendering modes better than the unicode-width default of 4.
+        assert_eq!(visible_width("🇺🇸"), 2);
+        assert_eq!(visible_width("🇨🇳"), 2);
+        assert_eq!(visible_width("🇯🇵"), 2);
+    }
+
+    #[test]
+    fn flag_plus_label_width_accounts_for_pair_as_two_cells() {
+        assert_eq!(visible_width("🇺🇸 United States"), 16);
+        assert_eq!(visible_width("🇨🇳 China"), 8);
+        assert_eq!(visible_width("🇬🇧 United Kingdom"), 17);
+    }
+
+    #[test]
+    fn lone_regional_indicator_is_single_cell() {
+        // An unpaired regional indicator is not a flag. Terminals with
+        // Nerd Font render it as a single tofu box; we match that.
+        assert_eq!(visible_width("\u{1F1FA}"), 1);
+    }
+
+    #[test]
+    fn ansi_escapes_are_stripped_before_counting() {
+        assert_eq!(visible_width("\x1b[1mbold\x1b[0m"), 4);
+        assert_eq!(visible_width("\x1b[38;2;255;0;0m🇺🇸\x1b[0m hi"), 5);
     }
 }
