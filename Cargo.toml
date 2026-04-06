@@ -1,0 +1,18 @@
+[package]
+name = "mdstream"
+version = "0.1.0"
+description = "Rust rewrite of mdstream: a hybrid streaming Markdown renderer for terminals"
+edition = "2024"
+rust-version = "1.94"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.0", features = ["derive", "env"] }
+crossterm = "0.29.0"
+regex = "1.12.3"
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+insta = "1.46.3"
+pretty_assertions = "1.4.1"
