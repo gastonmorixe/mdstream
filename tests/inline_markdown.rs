@@ -20,6 +20,17 @@ fn renders_inline_markdown_and_rules() {
 }
 
 #[test]
+fn inline_code_uses_foreground_only_style() {
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+
+    let rendered = renderer.render_line("`code`\n");
+
+    assert!(!rendered.contains("\x1b[48;"));
+    assert!(rendered.contains("\x1b[38;2;180;140;255m"));
+    assert_eq!(strip_ansi(&rendered), "code\n");
+}
+
+#[test]
 fn bare_url_skips_when_preceded_by_word_or_slash() {
     // Python `_BARE_URL_RE` at mdstream.py:149 carries `(?<![\w/])` to avoid
     // linkifying URLs that abut a word character or `/` on the left. The Rust
@@ -125,4 +136,16 @@ fn renders_links_images_and_escapes() {
     assert_eq!(image, "Image: Alt (https://example.com/image.png)\n");
     assert_eq!(link, "OpenAI (https://openai.com)\n");
     assert_eq!(escaped, "*not italic* and https://example.com\n");
+}
+
+#[test]
+fn decodes_basic_html_entities() {
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+
+    let rendered = strip_ansi(
+        &renderer
+            .render_line("**A**&nbsp;&amp;&nbsp;&lt;tag&gt;&nbsp;&quot;x&quot;&nbsp;&#39;y&#39;\n"),
+    );
+
+    assert_eq!(rendered, "A & <tag> \"x\" 'y'\n");
 }

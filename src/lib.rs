@@ -1,9 +1,11 @@
 pub mod cli;
+pub mod help;
 pub mod renderer;
 pub mod theme;
 
 use anyhow::Result;
 use std::io::{self, IsTerminal, Write};
+use theme::DEFAULT_SHOW_CODE_BACKGROUND;
 
 /// Sentinel error returned when stdin is attached to a terminal instead of a
 /// pipe. The binary entry point catches this and exits non-zero without
@@ -25,12 +27,21 @@ pub fn run(cli: cli::Cli) -> Result<()> {
     let mut stderr = io::stderr().lock();
     handle_tty_check(is_tty, &mut stderr)?;
 
-    let mut renderer = renderer::StreamingMarkdownRenderer::with_code_theme(
+    let show_code_background = if cli.code_background {
+        true
+    } else if cli.no_code_background {
+        false
+    } else {
+        DEFAULT_SHOW_CODE_BACKGROUND
+    };
+
+    let mut renderer = renderer::StreamingMarkdownRenderer::with_code_theme_and_inline_code_color(
         cli.padding,
         !cli.no_lineno,
         !cli.no_list_guides,
         cli.theme,
-        !cli.no_code_background,
+        show_code_background,
+        cli.inline_code_color,
     );
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -47,48 +58,7 @@ pub fn handle_tty_check<W: Write>(is_tty: bool, stderr: &mut W) -> Result<()> {
     if !is_tty {
         return Ok(());
     }
-    writeln!(stderr, "mdstream — Streaming Markdown Renderer")?;
-    writeln!(stderr)?;
-    writeln!(
-        stderr,
-        "  Real-time token streaming with rendered markdown output."
-    )?;
-    writeln!(
-        stderr,
-        "  Partial lines stream raw; completed lines render fully."
-    )?;
-    writeln!(stderr)?;
-    writeln!(stderr, "Usage:")?;
-    writeln!(stderr, "  mdstream < input.md")?;
-    writeln!(stderr, "  llm \"prompt\" | mdstream")?;
-    writeln!(stderr)?;
-    writeln!(stderr, "Environment:")?;
-    writeln!(
-        stderr,
-        "  MDSTREAM_PADDING         Left padding in spaces (default: 0)"
-    )?;
-    writeln!(
-        stderr,
-        "  MDSTREAM_NO_LINENO       Disable line numbers in fenced code blocks"
-    )?;
-    writeln!(
-        stderr,
-        "  MDSTREAM_NO_LIST_GUIDES  Disable vertical indent guides for nested lists"
-    )?;
-    writeln!(
-        stderr,
-        "  MDSTREAM_THEME           Syntect theme for fenced code blocks"
-    )?;
-    writeln!(
-        stderr,
-        "  MDSTREAM_NO_CODE_BACKGROUND  Disable themed code-block backgrounds"
-    )?;
-    writeln!(stderr)?;
-    writeln!(
-        stderr,
-        "Themes: {}",
-        crate::theme::CodeTheme::all_names_csv()
-    )?;
+    write!(stderr, "{}", crate::help::tty_banner())?;
     Err(StdinIsTerminal.into())
 }
 
@@ -116,12 +86,10 @@ mod tests {
         );
 
         let banner = String::from_utf8(stderr.into_inner()).unwrap();
-        assert!(banner.contains("mdstream — Streaming Markdown Renderer"));
-        assert!(banner.contains("MDSTREAM_PADDING"));
-        assert!(banner.contains("MDSTREAM_NO_LINENO"));
-        assert!(banner.contains("MDSTREAM_NO_LIST_GUIDES"));
-        assert!(banner.contains("MDSTREAM_THEME"));
-        assert!(banner.contains("MDSTREAM_NO_CODE_BACKGROUND"));
-        assert!(banner.contains("base16-ocean-dark"));
+        assert!(banner.contains("mdstream"));
+        assert!(banner.contains("Streaming Markdown renderer for terminals"));
+        assert!(banner.contains("mdstream < input.md"));
+        assert!(banner.contains("mdstream --help"));
+        assert!(!banner.contains("llm"));
     }
 }

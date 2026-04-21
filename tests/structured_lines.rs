@@ -152,3 +152,14 @@ fn heading_clears_list_state() {
     // After heading, list state resets so depth goes back to 0
     assert_eq!(after, "  • c\n");
 }
+
+#[test]
+fn ignores_presentation_only_html_wrapper_lines() {
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+
+    assert_eq!(renderer.render_line("<div align=\"center\">\n"), "");
+    assert_eq!(renderer.render_line("</div>\n"), "");
+
+    let heading = strip_ansi(&renderer.render_line("# Title\n"));
+    assert_eq!(heading, "Title\n━━━━━\n");
+}

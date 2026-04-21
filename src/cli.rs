@@ -1,13 +1,12 @@
 use clap::Parser;
 
-use crate::theme::{CodeTheme, DEFAULT_CODE_THEME};
+use crate::theme::{CodeTheme, DEFAULT_CODE_THEME, DEFAULT_INLINE_CODE_COLOR, PaletteColor};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "mdstream",
     version,
-    about = "Hybrid streaming Markdown renderer for terminal output",
-    after_help = "License: MIT  ·  Copyright (c) 2026 Gaston Morixe <gaston@gastonmorixe.com>\nHomepage: https://github.com/gastonmorixe/mdstream"
+    about = "Streaming Markdown renderer for terminals"
 )]
 pub struct Cli {
     #[arg(
@@ -38,14 +37,32 @@ pub struct Cli {
         long,
         env = "MDSTREAM_THEME",
         default_value_t = DEFAULT_CODE_THEME,
-        help = "Syntect theme for fenced code blocks"
+        help = "Code theme for fenced code blocks"
     )]
     pub theme: CodeTheme,
 
     #[arg(
         long,
+        env = "MDSTREAM_INLINE_CODE_COLOR",
+        default_value_t = DEFAULT_INLINE_CODE_COLOR,
+        help = "Inline code accent color from the h1-h6 palette"
+    )]
+    pub inline_code_color: PaletteColor,
+
+    #[arg(
+        long,
+        env = "MDSTREAM_CODE_BACKGROUND",
+        default_value_t = false,
+        conflicts_with = "no_code_background",
+        help = "Enable themed backgrounds in fenced code blocks"
+    )]
+    pub code_background: bool,
+
+    #[arg(
+        long,
         env = "MDSTREAM_NO_CODE_BACKGROUND",
         default_value_t = false,
+        conflicts_with = "code_background",
         help = "Disable themed backgrounds in fenced code blocks"
     )]
     pub no_code_background: bool,

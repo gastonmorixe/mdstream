@@ -1,4 +1,7 @@
-use crate::theme::{CodeTheme, DEFAULT_CODE_THEME};
+use crate::theme::{
+    CodeTheme, DEFAULT_CODE_THEME, DEFAULT_INLINE_CODE_COLOR, DEFAULT_SHOW_CODE_BACKGROUND,
+    PaletteColor, load_theme_set,
+};
 use anyhow::Result;
 use crossterm::terminal;
 use regex::Regex;
@@ -17,20 +20,12 @@ const ITALIC: &str = "\x1b[3m";
 const UNDERLINE: &str = "\x1b[4m";
 const STRIKETHROUGH: &str = "\x1b[9m";
 const BRIGHT_BLUE: &str = "\x1b[94m";
-const BRIGHT_CYAN: &str = "\x1b[96m";
 const BRIGHT_GREEN: &str = "\x1b[92m";
 const BRIGHT_MAGENTA: &str = "\x1b[95m";
-const BG_CODE: &str = "\x1b[48;5;236m";
 
 const LIST_BULLETS: &[&str] = &["•", "◦", "▪", "‣"];
 
 const LANG_COLOR_DEFAULT: &str = DIM;
-const H1_COLOR: &str = "\x1b[38;2;255;100;100m";
-const H2_COLOR: &str = "\x1b[38;2;255;170;80m";
-const H3_COLOR: &str = "\x1b[38;2;100;220;100m";
-const H4_COLOR: &str = "\x1b[38;2;100;180;255m";
-const H5_COLOR: &str = "\x1b[38;2;180;140;255m";
-const H6_COLOR: &str = "\x1b[38;2;200;120;180m";
 
 const LANG_COLORS: &[(&str, &str)] = &[
     ("rust", "\x1b[38;2;255;140;60m"),
@@ -172,14 +167,14 @@ impl SyntectAssets {
     fn load() -> Self {
         Self {
             syntax_set: SyntaxSet::load_defaults_newlines(),
-            theme_set: ThemeSet::load_defaults(),
+            theme_set: load_theme_set(),
         }
     }
 
     fn theme(&self, code_theme: CodeTheme) -> &Theme {
         self.theme_set
             .themes
-            .get(code_theme.syntect_name())
+            .get(code_theme.theme_key())
             .or_else(|| self.theme_set.themes.values().next())
             .expect("syntect default themes should not be empty")
     }
@@ -211,6 +206,30 @@ fn split_blockquote(line: &str) -> (usize, &str) {
     if depth == 0 { (0, line) } else { (depth, rest) }
 }
 
+fn ignored_html_wrapper_tag(line: &str) -> bool {
+    let stripped = line.trim();
+    if !(stripped.starts_with('<') && stripped.ends_with('>')) {
+        return false;
+    }
+    if stripped.contains("://") {
+        return false;
+    }
+
+    let inner = stripped
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .trim();
+    let tag = inner
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    matches!(tag.as_str(), "div" | "span" | "p" | "center")
+}
+
 fn split_table_row(line: &str) -> Option<Vec<String>> {
     let mut stripped = line.trim();
     if !stripped.contains('|') {
@@ -222,10 +241,44 @@ fn split_table_row(line: &str) -> Option<Vec<String>> {
     if let Some(rest) = stripped.strip_suffix('|') {
         stripped = rest;
     }
-    let cells: Vec<String> = stripped
-        .split('|')
-        .map(|cell| cell.trim().to_owned())
-        .collect();
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut chars = stripped.chars().peekable();
+    let mut code_span_ticks: Option<usize> = None;
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            current.push(ch);
+            if let Some(next) = chars.next() {
+                current.push(next);
+            }
+            continue;
+        }
+
+        if ch == '`' {
+            let mut tick_count = 1usize;
+            while matches!(chars.peek(), Some('`')) {
+                chars.next();
+                tick_count += 1;
+            }
+            current.push_str(&"`".repeat(tick_count));
+            match code_span_ticks {
+                Some(active) if active == tick_count => code_span_ticks = None,
+                None => code_span_ticks = Some(tick_count),
+                _ => {}
+            }
+            continue;
+        }
+
+        if ch == '|' && code_span_ticks.is_none() {
+            cells.push(current.trim().to_owned());
+            current.clear();
+            continue;
+        }
+
+        current.push(ch);
+    }
+    cells.push(current.trim().to_owned());
     if cells.len() < 2 { None } else { Some(cells) }
 }
 
@@ -250,7 +303,9 @@ fn parse_table_separator(line: &str) -> Option<Vec<Alignment>> {
 
 fn looks_like_table_row(line: &str) -> bool {
     let stripped = line.trim();
-    !stripped.is_empty() && table_candidate_re().is_match(stripped)
+    !stripped.is_empty()
+        && table_candidate_re().is_match(stripped)
+        && split_table_row(stripped).is_some()
 }
 
 fn block_prefix(base_pad: &str, quote_depth: usize) -> String {
@@ -345,6 +400,15 @@ fn render_image(alt: &str, url: &str) -> String {
     format!("{DIM}Image:{RESET} {BRIGHT_MAGENTA}{label}{RESET}{DIM} ({url}){RESET}")
 }
 
+fn decode_basic_html_entities(text: &str) -> String {
+    text.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
 fn apply_escapes(text: &str, placeholders: &mut Vec<String>) -> String {
     let mut out = String::new();
     let mut chars = text.chars().peekable();
@@ -362,15 +426,17 @@ fn apply_escapes(text: &str, placeholders: &mut Vec<String>) -> String {
     out
 }
 
-fn format_inline(text: &str) -> String {
+fn format_inline(text: &str, inline_code_color: PaletteColor) -> String {
     let mut placeholders = Vec::<String>::new();
-    let mut current = apply_escapes(text, &mut placeholders);
+    let decoded = decode_basic_html_entities(text);
+    let mut current = apply_escapes(&decoded, &mut placeholders);
 
     current = code_span_re()
         .replace_all(&current, |captures: &regex::Captures| {
             stash_placeholder(
                 format!(
-                    "{BG_CODE}{BRIGHT_CYAN}{}{RESET}",
+                    "{BOLD}{}{}{RESET}",
+                    inline_code_color.ansi_escape(),
                     captures.get(1).map(|m| m.as_str()).unwrap_or_default()
                 ),
                 &mut placeholders,
@@ -460,13 +526,12 @@ pub struct StreamingMarkdownRenderer {
     code_line_num: usize,
     show_lineno: bool,
     code_theme: CodeTheme,
+    inline_code_color: PaletteColor,
     show_code_background: bool,
     code_highlighter: Option<HighlightLines<'static>>,
     pending_table_header: Option<String>,
-    pending_table_rows: usize,
     table_lines: Vec<String>,
     table_alignments: Vec<Alignment>,
-    table_render_rows: usize,
     list_indent_stack: Vec<usize>,
     list_level_meta: Vec<ListLevelMeta>,
     active_list_context: Option<ListContext>,
@@ -507,7 +572,7 @@ impl StreamingMarkdownRenderer {
             show_lineno,
             show_list_guides,
             DEFAULT_CODE_THEME,
-            true,
+            DEFAULT_SHOW_CODE_BACKGROUND,
         )
     }
 
@@ -518,6 +583,24 @@ impl StreamingMarkdownRenderer {
         code_theme: CodeTheme,
         show_code_background: bool,
     ) -> Self {
+        Self::with_code_theme_and_inline_code_color(
+            padding,
+            show_lineno,
+            show_list_guides,
+            code_theme,
+            show_code_background,
+            DEFAULT_INLINE_CODE_COLOR,
+        )
+    }
+
+    pub fn with_code_theme_and_inline_code_color(
+        padding: usize,
+        show_lineno: bool,
+        show_list_guides: bool,
+        code_theme: CodeTheme,
+        show_code_background: bool,
+        inline_code_color: PaletteColor,
+    ) -> Self {
         Self {
             partial: String::new(),
             pad: " ".repeat(padding),
@@ -527,13 +610,12 @@ impl StreamingMarkdownRenderer {
             code_line_num: 0,
             show_lineno,
             code_theme,
+            inline_code_color,
             show_code_background,
             code_highlighter: None,
             pending_table_header: None,
-            pending_table_rows: 0,
             table_lines: Vec::new(),
             table_alignments: Vec::new(),
-            table_render_rows: 0,
             list_indent_stack: Vec::new(),
             list_level_meta: Vec::new(),
             active_list_context: None,
@@ -553,36 +635,41 @@ impl StreamingMarkdownRenderer {
             .ok()
             .and_then(|value| CodeTheme::parse(&value).ok())
             .unwrap_or(DEFAULT_CODE_THEME);
-        let show_code_background = std::env::var("MDSTREAM_NO_CODE_BACKGROUND").is_err();
-        Self::with_code_theme(
+        let inline_code_color = std::env::var("MDSTREAM_INLINE_CODE_COLOR")
+            .ok()
+            .and_then(|value| PaletteColor::parse(&value).ok())
+            .unwrap_or(DEFAULT_INLINE_CODE_COLOR);
+        let show_code_background = std::env::var("MDSTREAM_CODE_BACKGROUND")
+            .ok()
+            .map(|_| true)
+            .unwrap_or_else(|| {
+                std::env::var("MDSTREAM_NO_CODE_BACKGROUND")
+                    .ok()
+                    .map(|_| false)
+                    .unwrap_or(DEFAULT_SHOW_CODE_BACKGROUND)
+            });
+        Self::with_code_theme_and_inline_code_color(
             padding,
             show_lineno,
             show_list_guides,
             code_theme,
             show_code_background,
+            inline_code_color,
         )
     }
 
     pub fn render_line(&mut self, line: &str) -> String {
         let stripped = line.trim_end_matches('\n');
-        let rendered = if self.in_code_block {
+        let ignored_html = !self.in_code_block && ignored_html_wrapper_tag(stripped);
+        let rendered = if ignored_html {
+            self.clear_list_state();
+            self.flush_buffered_table()
+        } else if self.in_code_block {
             self.render_code_line(stripped)
-        } else if !self.table_lines.is_empty() {
-            if let Some(table) = self.maybe_extend_table(stripped) {
-                table
-            } else if self.pending_table_header.is_some() {
-                self.maybe_promote_table(stripped)
-                    .unwrap_or_else(|| self.render_noncode_line(stripped))
-            } else {
-                self.render_noncode_line(stripped)
-            }
-        } else if self.pending_table_header.is_some() {
-            self.maybe_promote_table(stripped)
-                .unwrap_or_else(|| self.render_noncode_line(stripped))
         } else {
             self.render_noncode_line(stripped)
         };
-        self.previous_was_blank = stripped.is_empty();
+        self.previous_was_blank = stripped.is_empty() || ignored_html;
         rendered
     }
 
@@ -619,6 +706,10 @@ impl StreamingMarkdownRenderer {
             self.erase_partial(out)?;
             let partial = std::mem::take(&mut self.partial);
             write!(out, "{}", self.render_line(&(partial + "\n")))?;
+        }
+        let buffered = self.flush_buffered_table();
+        if !buffered.is_empty() {
+            write!(out, "{buffered}")?;
         }
         Ok(())
     }
@@ -773,7 +864,7 @@ impl StreamingMarkdownRenderer {
         };
 
         self.set_list_context(&rendered_prefix, source_indent_width, marker_width);
-        let rendered_body = format_inline(body);
+        let rendered_body = format_inline(body, self.inline_code_color);
         format!("{rendered_prefix}{marker_text} {rendered_body}\n")
     }
 
@@ -797,11 +888,23 @@ impl StreamingMarkdownRenderer {
         Some(format!(
             "{}{}\n",
             ctx.continuation_prefix,
-            format_inline(trimmed)
+            format_inline(trimmed, self.inline_code_color)
         ))
     }
 
     fn render_noncode_line(&mut self, stripped: &str) -> String {
+        if !self.table_lines.is_empty() {
+            return self.render_after_active_table(stripped);
+        }
+
+        if self.pending_table_header.is_some() {
+            return self.render_after_table_candidate(stripped);
+        }
+
+        self.render_noncode_line_without_table(stripped)
+    }
+
+    fn render_noncode_line_without_table(&mut self, stripped: &str) -> String {
         if let Some(captures) = fence_re().captures(stripped) {
             self.clear_list_state();
             return self.render_code_fence(captures.get(3).map(|m| m.as_str()).unwrap_or_default());
@@ -809,13 +912,54 @@ impl StreamingMarkdownRenderer {
 
         if looks_like_table_row(stripped) {
             self.clear_list_state();
-            let rendered = self.render_structured_line(stripped);
             self.pending_table_header = Some(stripped.to_owned());
-            self.pending_table_rows = self.measure_rendered_rows(&rendered);
-            return rendered;
+            return String::new();
         }
 
         self.render_structured_line(stripped)
+    }
+
+    fn render_after_table_candidate(&mut self, stripped: &str) -> String {
+        let alignments = parse_table_separator(stripped);
+        let header_cells = self
+            .pending_table_header
+            .as_deref()
+            .and_then(split_table_row);
+
+        if let (Some(alignments), Some(header_cells)) = (alignments, header_cells)
+            && alignments.len() == header_cells.len()
+        {
+            self.table_lines = vec![
+                self.pending_table_header.take().unwrap(),
+                stripped.to_owned(),
+            ];
+            self.table_alignments = alignments;
+            return String::new();
+        }
+
+        let pending = self.flush_buffered_table();
+        let current = self.render_noncode_line(stripped);
+        format!("{pending}{current}")
+    }
+
+    fn render_after_active_table(&mut self, stripped: &str) -> String {
+        let row_cells = split_table_row(stripped);
+        let header_cells = self
+            .table_lines
+            .first()
+            .and_then(|line| split_table_row(line));
+
+        if let (Some(row_cells), Some(header_cells)) = (row_cells, header_cells)
+            && row_cells.len() == header_cells.len()
+            && parse_table_separator(stripped).is_none()
+        {
+            self.table_lines.push(stripped.to_owned());
+            return String::new();
+        }
+
+        let table = self.flush_buffered_table();
+        let current = self.render_noncode_line(stripped);
+        format!("{table}{current}")
     }
 
     fn render_code_fence(&mut self, rest: &str) -> String {
@@ -928,14 +1072,7 @@ impl StreamingMarkdownRenderer {
                 .unwrap_or_default()
                 .trim_end_matches('#')
                 .trim_end();
-            let color = match level {
-                1 => H1_COLOR,
-                2 => H2_COLOR,
-                3 => H3_COLOR,
-                4 => H4_COLOR,
-                5 => H5_COLOR,
-                _ => H6_COLOR,
-            };
+            let color = PaletteColor::for_heading_level(level).ansi_escape();
             let leading_gap = if self.previous_was_blank { "" } else { "\n" };
             let heading = format!("{leading_gap}{}{BOLD}{color}{value}{RESET}\n", self.pad);
             return match level {
@@ -997,58 +1134,22 @@ impl StreamingMarkdownRenderer {
         }
 
         self.clear_list_state();
-        format!("{prefix}{}\n", format_inline(text))
+        format!("{prefix}{}\n", format_inline(text, self.inline_code_color))
     }
 
-    fn maybe_promote_table(&mut self, stripped: &str) -> Option<String> {
-        let alignments = parse_table_separator(stripped);
-        let header_cells = self
-            .pending_table_header
-            .as_deref()
-            .and_then(split_table_row);
-
-        if let (Some(alignments), Some(header_cells)) = (alignments, header_cells)
-            && alignments.len() == header_cells.len()
-        {
-            self.table_lines = vec![
-                self.pending_table_header.take().unwrap(),
-                stripped.to_owned(),
-            ];
-            self.table_alignments = alignments;
-            let rendered_table = self.render_table();
-            let erase = self.erase_rendered_rows(self.pending_table_rows);
-            self.pending_table_rows = 0;
-            self.table_render_rows = self.measure_rendered_rows(&rendered_table);
-            return Some(format!("{erase}{rendered_table}"));
+    fn flush_buffered_table(&mut self) -> String {
+        if !self.table_lines.is_empty() {
+            let rendered = self.render_table();
+            self.table_lines.clear();
+            self.table_alignments.clear();
+            return rendered;
         }
 
-        self.pending_table_header = None;
-        self.pending_table_rows = 0;
-        None
-    }
-
-    fn maybe_extend_table(&mut self, stripped: &str) -> Option<String> {
-        let row_cells = split_table_row(stripped);
-        let header_cells = self
-            .table_lines
-            .first()
-            .and_then(|line| split_table_row(line));
-
-        if let (Some(row_cells), Some(header_cells)) = (row_cells, header_cells)
-            && row_cells.len() == header_cells.len()
-            && parse_table_separator(stripped).is_none()
-        {
-            self.table_lines.push(stripped.to_owned());
-            let rendered_table = self.render_table();
-            let erase = self.erase_rendered_rows(self.table_render_rows);
-            self.table_render_rows = self.measure_rendered_rows(&rendered_table);
-            return Some(format!("{erase}{rendered_table}"));
+        if let Some(header) = self.pending_table_header.take() {
+            return self.render_structured_line(&header);
         }
 
-        self.table_lines.clear();
-        self.table_alignments.clear();
-        self.table_render_rows = 0;
-        None
+        String::new()
     }
 
     fn render_table(&self) -> String {
@@ -1064,11 +1165,20 @@ impl StreamingMarkdownRenderer {
 
         let styled_header: Vec<String> = header
             .iter()
-            .map(|cell| format!("{BOLD}{}{RESET}", format_inline(cell)))
+            .map(|cell| {
+                format!(
+                    "{BOLD}{}{RESET}",
+                    format_inline(cell, self.inline_code_color)
+                )
+            })
             .collect();
         let styled_rows: Vec<Vec<String>> = body_rows
             .iter()
-            .map(|row| row.iter().map(|cell| format_inline(cell)).collect())
+            .map(|row| {
+                row.iter()
+                    .map(|cell| format_inline(cell, self.inline_code_color))
+                    .collect()
+            })
             .collect();
 
         for (idx, cell) in styled_header.iter().enumerate() {
@@ -1143,24 +1253,6 @@ impl StreamingMarkdownRenderer {
             write!(out, "\x1b[{}A\r\x1b[J", rows - 1)?;
         }
         Ok(())
-    }
-
-    fn erase_rendered_rows(&self, rows: usize) -> String {
-        if rows == 0 {
-            String::new()
-        } else {
-            format!("\x1b[{rows}A\r\x1b[J")
-        }
-    }
-
-    fn measure_rendered_rows(&self, rendered: &str) -> usize {
-        let width = self.term_width().max(1);
-        let mut total = 0usize;
-        for line in rendered.lines() {
-            let visible = visible_width(line).max(1);
-            total += visible.div_ceil(width).max(1);
-        }
-        total.max(1)
     }
 
     fn term_width(&self) -> usize {

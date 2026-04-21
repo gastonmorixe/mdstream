@@ -15,11 +15,11 @@
 
 </div>
 
-mdstream renders Markdown **the moment it arrives**. Pipe a partial document in and watch each line resolve into styled output as soon as its newline lands. Tables *repaint in place* when new rows show up. Code blocks pick up syntax highlighting. It's built to pair with **LLM CLIs** and anything else that emits text **a token at a time**.
+mdstream renders Markdown **the moment it arrives**. Pipe a partial document in and watch each line resolve into styled output as soon as its newline lands. Tables *repaint in place* when new rows show up. Code blocks pick up syntax highlighting. It's built for **streaming text producers** and anything else that emits text **a token at a time**.
 
 ## Why mdstream
 
-Most terminal Markdown renderers **wait for stdin to close** before drawing anything. That's fine for files. It's painful for `llm "explain this"`, where output trickles in *word by word* and you want to read along.
+Most terminal Markdown renderers **wait for stdin to close** before drawing anything. That's fine for files. It's painful for any stream where output trickles in *word by word* and you want to read along.
 
 mdstream takes the **opposite approach**. Raw partial lines stream straight to the terminal so you see characters appear *instantly*. The moment a newline arrives, the line is **erased and re-rendered** with full styling. Block-level state (tables, code fences, lists) persists across the stream so everything stays coherent. The result feels like a *chat UI*, but it's a plain terminal pipeline.
 
@@ -30,7 +30,7 @@ mdstream takes the **opposite approach**. Raw partial lines stream straight to t
 - 📰 **Six heading levels**: distinct color for each. H1 underlined with `━`, H2 with a dimmed `─`, H3-H6 bold-colored only.
 - 📋 **Lists**: depth-rotating bullets (`•◦▪‣`), vertical indent guides, hierarchical ordered numbering (write `1.2.3. Section` literally and it renders), task checkboxes (`☑` / `☐`), and continuation-line alignment.
 - 📊 **Pipe tables**: promotion on the separator row, in-place repaint as new rows arrive, three alignment modes (left, right, center), and Unicode-correct column widths.
-- 💻 **Fenced code blocks**: `syntect`-backed highlighting with selectable built-in themes, themed code backgrounds on by default, optional line numbers, and language-specific label colors for ~30 common languages including Rust, Python, JS/TS, Go, Ruby, Java, Swift, Bash, Zig, Elixir, Haskell, and friends.
+- 💻 **Fenced code blocks**: `syntect`-backed highlighting with bundled built-in themes, vendored third-party themes, a custom mdstream house theme, foreground-only rendering by default, optional themed backgrounds, optional line numbers, and language-specific label colors for ~30 common languages including Rust, Python, JS/TS, Go, Ruby, Java, Swift, Bash, Zig, Elixir, Haskell, and friends.
 - ✨ **Inline formatting**: bold, italic, bold+italic, strikethrough, code spans, links, images, autolinks, bare URLs (with adjacency guard), and backslash escapes for the full Markdown punctuation set.
 - 💬 **Blockquotes**: depth tracking, tab- and unicode-whitespace-tolerant parsing, and dimmed `│` bars.
 - 🌐 **True Unicode display width**: via `unicode-width`, so CJK, fullwidth digits, and emoji all align correctly inside tables and wrap math.
@@ -50,8 +50,8 @@ The `mdstream` binary lands in `~/.cargo/bin`. Make sure that directory is on yo
 ## Quick examples
 
 ```bash
-# Pair with an LLM CLI
-llm "explain quicksort" | mdstream
+# Preview a slow stream
+{ printf '# Quicksort\n'; sleep 0.5; printf '\n'; sleep 0.5; printf '- divide\n'; sleep 0.5; printf '- partition\n'; } | mdstream
 
 # Render a file
 mdstream < README.md
@@ -71,8 +71,11 @@ mdstream --no-lineno < script.md
 # Switch code highlighting theme
 mdstream --theme solarized-dark < README.md
 
-# Keep syntax colors but disable code-block backgrounds
-mdstream --no-code-background < README.md
+# Try one of the bundled third-party themes
+mdstream --theme catppuccin-mocha < README.md
+
+# Opt into themed code-block backgrounds
+mdstream --code-background < README.md
 
 # Fake a slow stream and watch lines bloom in real time
 { for s in '# Hello' '' '- one' '- two' '- three'; do echo "$s"; sleep 0.5; done; } | mdstream
@@ -90,7 +93,7 @@ mdstream --no-code-background < README.md
 | Ordered list | `1. item` | bold marker; literal `1.2.3.` is also accepted |
 | Task list | `- [x] done` | green `☑` / dim `☐` |
 | Blockquote | `> quoted` | dim `│` prefix, depth-aware |
-| Code span | `` `code` `` | cyan on a dark grey background |
+| Code span | `` `code` `` | bold violet accent, no background |
 | Bold | `**text**` | bold |
 | Italic | `*text*` | italic |
 | Bold + italic | `***text***` | bold and italic |
@@ -99,7 +102,7 @@ mdstream --no-code-background < README.md
 | Image | `![alt](url)` | `Image:` tag, magenta label, dim url |
 | Bare URL | `https://...` | underlined blue (skipped if glued to a word) |
 | Pipe table | `\| h \| ... \|` | bold centered header, `━`/`─` separators, `│` columns |
-| Code fence | ```` ```rust ```` | colored language label, line numbers, syntect theme colors and backgrounds |
+| Code fence | ```` ```rust ```` | colored language label, line numbers, syntect theme colors, optional backgrounds |
 
 ## Configuration
 
@@ -110,13 +113,18 @@ mdstream takes flags or environment variables. **Flags win** when both are set.
 | `--padding N` | `MDSTREAM_PADDING` | `0` | Left padding in spaces |
 | `--no-lineno` | `MDSTREAM_NO_LINENO` | off | Hide line numbers in fenced code blocks |
 | `--no-list-guides` | `MDSTREAM_NO_LIST_GUIDES` | off | Hide vertical guides on nested lists |
-| `--theme THEME` | `MDSTREAM_THEME` | `base16-ocean-dark` | Syntect theme for fenced code blocks |
+| `--theme THEME` | `MDSTREAM_THEME` | `mdstream` | Code theme for fenced code blocks |
+| `--inline-code-color COLOR` | `MDSTREAM_INLINE_CODE_COLOR` | `h5` | Inline code accent from the `h1`-`h6` palette |
+| `--code-background` | `MDSTREAM_CODE_BACKGROUND` | off | Enable themed backgrounds in fenced code blocks |
 | `--no-code-background` | `MDSTREAM_NO_CODE_BACKGROUND` | off | Disable themed backgrounds in fenced code blocks |
 
 Run `mdstream --help` for the full surface.
 
-Built-in themes:
-`inspired-github`, `solarized-dark`, `solarized-light`, `base16-eighties-dark`, `base16-mocha-dark`, `base16-ocean-dark`, `base16-ocean-light`.
+Available themes:
+`mdstream`, `catppuccin-mocha`, `sublime-snazzy`, `dracula`, `inspired-github`, `solarized-dark`, `solarized-light`, `base16-eighties-dark`, `base16-mocha-dark`, `base16-ocean-dark`, `base16-ocean-light`.
+
+Inline palette values:
+`h1`, `h2`, `h3`, `h4`, `h5`, `h6`.
 
 If you run `mdstream` without piping anything in, it prints a usage banner to stderr and exits **non-zero**, so shell scripts can detect the misuse.
 
@@ -128,7 +136,7 @@ That structure keeps the renderer **fast and small**. There's no AST. No parser 
 
 All **18 regex patterns** compile *lazily, once*, via `OnceLock`. The `syntect` syntax and theme sets are loaded the same way, on first use. *Cold-start cost stays in the binary, not in the user's reading latency.*
 
-Code highlighting goes through `syntect` with the bundled built-in themes and the `default-fancy` feature set, so the binary stays **pure Rust** with **no C dependencies**. `base16-ocean-dark` is the default, and fenced code now renders the theme background unless you opt out with `--no-code-background`.
+Code highlighting goes through `syntect` with the bundled built-in themes and the `default-fancy` feature set, so the binary stays **pure Rust** with **no C dependencies**. mdstream now ships a custom `mdstream` theme plus vendored `Catppuccin Mocha`, `Sublime Snazzy`, and `Dracula` `.tmTheme` files in the binary. `mdstream` is the default theme, and fenced code stays foreground-only unless you opt into themed backgrounds with `--code-background`.
 
 If you need a structurally correct **full-document** Markdown parser, look at [`comrak`](https://github.com/kivikakk/comrak) or [`pulldown-cmark`](https://github.com/raphlinus/pulldown-cmark). If you want fast, terminal-shaped, **streaming** rendering, mdstream is built for that one job.
 
@@ -142,7 +150,7 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-The test suite is **27 checks** across seven integration files plus a lib unit module: streaming chunk handling, every block-level renderer, inline formatting, the table promotion and repaint state machine, fenced code blocks, the CLI surface, the TTY-detection branch, and an *end-to-end snapshot* of a mixed-content document.
+The test suite is **57 tests** across seven integration files plus in-crate unit tests: streaming chunk handling, every block-level renderer, inline formatting, the table promotion and repaint state machine, fenced code blocks, the CLI surface, the TTY-detection branch, and an *end-to-end snapshot* of a mixed-content document.
 
 ## Contributing
 
@@ -150,4 +158,10 @@ Bug reports and pull requests are welcome at [github.com/gastonmorixe/mdstream](
 
 ## License
 
-[MIT](LICENSE) © [Gaston Morixe](https://gastonmorixe.com)
+MIT
+
+Creator: Gaston Morixe <gaston@gastonmorixe.com>
+Repository: https://github.com/gastonmorixe/mdstream
+Copyright 2026 Gaston Morixe
+
+See [LICENSE](LICENSE).

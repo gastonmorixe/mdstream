@@ -1,3 +1,8 @@
 /target
 .node-net-dbg/
 tmp/
+
+.DS_Store
+*.snap.new
+.env
+.env.*
