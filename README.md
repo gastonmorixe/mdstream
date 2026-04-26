@@ -17,6 +17,9 @@
 
 mdstream renders Markdown **the moment it arrives**. Pipe a partial document in and watch each line resolve into styled output as soon as its newline lands. Tables *repaint in place* when new rows show up. Code blocks pick up syntax highlighting. It's built for **streaming text producers** and anything else that emits text **a token at a time**.
 
+Docs: [streaming renderer internals](docs/how-mdstream-streaming-renderer-works.md)
+Changelog: [CHANGELOG.md](CHANGELOG.md)
+
 ## Why mdstream
 
 Most terminal Markdown renderers **wait for stdin to close** before drawing anything. That's fine for files. It's painful for any stream where output trickles in *word by word* and you want to read along.
@@ -38,6 +41,18 @@ mdstream takes the **opposite approach**. Raw partial lines stream straight to t
 - 📦 **Single static binary**: pure Rust, no C dependencies (`syntect` runs in `default-fancy` mode).
 
 ## Install
+
+### Prebuilt release binaries
+
+Each versioned tag publishes `.tar.gz` archives for:
+
+- Linux x86_64
+- Linux arm64
+- macOS arm64
+
+Download the archive for your platform from the [GitHub Releases page](https://github.com/gastonmorixe/mdstream/releases), extract it, and place the `mdstream` binary somewhere on your `$PATH`.
+
+### Build and install from source
 
 ```bash
 git clone https://github.com/gastonmorixe/mdstream
@@ -120,6 +135,24 @@ mdstream takes flags or environment variables. **Flags win** when both are set.
 
 Run `mdstream --help` for the full surface.
 
+## CI and releases
+
+The repo has two GitHub Actions workflows:
+
+- `CI`: runs on pushes to `main` and pull requests, then executes `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --locked`, and `cargo build --release --locked`.
+- `Release`: runs when a semantic version tag such as `v0.2.1` is pushed. It reruns the same verification steps first, then builds and attaches native release tarballs for Linux x86_64, Linux arm64, and macOS arm64.
+
+Typical release flow:
+
+```bash
+cargo fmt --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked
+cargo build --release --locked
+git tag v0.2.1
+git push origin main v0.2.1
+```
+
 Available themes:
 `mdstream`, `catppuccin-mocha`, `sublime-snazzy`, `dracula`, `inspired-github`, `solarized-dark`, `solarized-light`, `base16-eighties-dark`, `base16-mocha-dark`, `base16-ocean-dark`, `base16-ocean-light`.
 
@@ -145,16 +178,17 @@ If you need a structurally correct **full-document** Markdown parser, look at [`
 mdstream targets **Rust 1.94 or later** (edition 2024).
 
 ```bash
-cargo build --release
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked
+cargo build --release --locked
 ```
 
-The test suite is **57 tests** across seven integration files plus in-crate unit tests: streaming chunk handling, every block-level renderer, inline formatting, the table promotion and repaint state machine, fenced code blocks, the CLI surface, the TTY-detection branch, and an *end-to-end snapshot* of a mixed-content document.
+The test suite is **58 tests** across seven integration files plus in-crate unit tests: streaming chunk handling, every block-level renderer, inline formatting, the table promotion and repaint state machine, fenced code blocks, the CLI surface, the TTY-detection branch, and an *end-to-end snapshot* of a mixed-content document.
 
 ## Contributing
 
-Bug reports and pull requests are welcome at [github.com/gastonmorixe/mdstream](https://github.com/gastonmorixe/mdstream). Before opening a PR, please run `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
+Bug reports and pull requests are welcome at [github.com/gastonmorixe/mdstream](https://github.com/gastonmorixe/mdstream). Before opening a PR, please run `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --locked`, and `cargo build --release --locked`.
 
 ## License
 

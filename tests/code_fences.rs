@@ -113,3 +113,13 @@ fn code_fences_load_dracula() {
     assert!(line.contains("\x1b[48;2;40;42;54m"));
     assert!(line.contains("\x1b[38;2;255;121;198m"));
 }
+
+#[test]
+fn typescript_fences_fall_back_to_javascript_highlighting() {
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+    renderer.render_line("```typescript\n");
+    let line = renderer.render_line("function greet(name: string): string {\n");
+
+    assert!(line.contains("\x1b[38;2;123;167;255mfunction"));
+    assert!(line.contains("\x1b[38;2;96;214;255mgreet"));
+}

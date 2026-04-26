@@ -192,6 +192,17 @@ fn lang_color(lang: &str) -> &'static str {
         .unwrap_or(LANG_COLOR_DEFAULT)
 }
 
+fn normalize_syntax_token(lang: &str) -> &str {
+    if matches!(
+        lang.trim().to_ascii_lowercase().as_str(),
+        "typescript" | "ts" | "mts" | "cts" | "tsx"
+    ) {
+        "javascript"
+    } else {
+        lang
+    }
+}
+
 fn split_blockquote(line: &str) -> (usize, &str) {
     // Strip any leading whitespace (tabs, spaces, NBSP, ...) before the first
     // `>` to match Python `_split_blockquote` (mdstream.py:236, `\s*` prefix).
@@ -1007,7 +1018,7 @@ impl StreamingMarkdownRenderer {
         let assets = syntect_assets();
         let syntax = assets
             .syntax_set
-            .find_syntax_by_token(lang)
+            .find_syntax_by_token(normalize_syntax_token(lang))
             .unwrap_or_else(|| assets.syntax_set.find_syntax_plain_text());
         HighlightLines::new(syntax, assets.theme(code_theme))
     }
