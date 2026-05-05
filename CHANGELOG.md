@@ -4,6 +4,8 @@ All notable changes to `mdstream` are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-05-05
+
 ### Fixed
 
 - Partial-paragraph redraw is now resize-safe and host-width aware. The renderer tracks the wrapped row count of the in-progress partial as bytes are emitted (using the terminal width that was live at each emit), instead of recomputing it from `terminal::size()` at flush time. Previous behavior left a stranded raw-markdown wrap row in scrollback above the rendered version when the width seen at flush differed from the width in effect when the bytes were originally drawn (mid-stream resize, or `/dev/tty` returning a value that disagreed with the host's `process.stdout.columns`).
@@ -11,6 +13,10 @@ All notable changes to `mdstream` are documented in this file.
 ### Added
 
 - `term_width()` honors the `COLUMNS` environment variable when no test override is set, falling back to `/dev/tty` only if `COLUMNS` is unset or unparseable. Hosts that pipe stdio to mdstream (e.g. embedding terminals) can now pin the width explicitly and have it respected by the partial-redraw math.
+
+### Changed
+
+- Completed task list items now render with `✔` instead of `☑` for a cleaner, more legible glyph at typical terminal font sizes.
 
 ## [0.2.1] - 2026-04-23
 
