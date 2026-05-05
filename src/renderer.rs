@@ -11,7 +11,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::as_24_bit_terminal_escaped;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -548,6 +548,20 @@ pub struct StreamingMarkdownRenderer {
     active_list_context: Option<ListContext>,
     show_list_guides: bool,
     term_width_override: Option<usize>,
+    /// Number of fully-wrapped rows the current partial occupies ABOVE the
+    /// cursor's current row. Total visual rows for the partial =
+    /// `partial_rows + 1`. Reset to 0 whenever `partial` is cleared, when a
+    /// `render_line` flush returns the cursor to col 0 of a fresh row, or
+    /// after `erase_partial` rewinds to the start of the partial.
+    partial_rows: usize,
+    /// Visual column the terminal cursor currently sits at within the
+    /// bottom row of the partial. Tracked using the terminal width that
+    /// was live at the moment each character of `partial` (and its
+    /// preceding `pad`) was emitted, so the count is robust against
+    /// mid-stream resizes — `term_width()` may report a different value
+    /// at erase time than it did at emit time, but we already accounted
+    /// for the wraps that actually happened on the user's terminal.
+    partial_col: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -632,6 +646,8 @@ impl StreamingMarkdownRenderer {
             active_list_context: None,
             show_list_guides,
             term_width_override: None,
+            partial_rows: 0,
+            partial_col: 0,
         }
     }
 
@@ -689,15 +705,19 @@ impl StreamingMarkdownRenderer {
         if parts.len() == 1 {
             if self.partial.is_empty() {
                 write!(out, "{}", self.pad)?;
+                self.advance_partial_position(&self.pad.clone());
             }
             self.partial.push_str(parts[0]);
             write!(out, "{}", parts[0])?;
+            self.advance_partial_position(parts[0]);
             return Ok(());
         }
 
         let first_complete = format!("{}{}", self.partial, parts[0]);
         self.erase_partial(out)?;
         self.partial.clear();
+        self.partial_rows = 0;
+        self.partial_col = 0;
         write!(out, "{}", self.render_line(&(first_complete + "\n")))?;
 
         for part in &parts[1..parts.len() - 1] {
@@ -707,7 +727,10 @@ impl StreamingMarkdownRenderer {
         self.partial = parts[parts.len() - 1].to_owned();
         if !self.partial.is_empty() {
             write!(out, "{}", self.pad)?;
-            write!(out, "{}", self.partial)?;
+            self.advance_partial_position(&self.pad.clone());
+            let new_partial = self.partial.clone();
+            write!(out, "{}", new_partial)?;
+            self.advance_partial_position(&new_partial);
         }
         Ok(())
     }
@@ -716,6 +739,8 @@ impl StreamingMarkdownRenderer {
         if !self.partial.is_empty() {
             self.erase_partial(out)?;
             let partial = std::mem::take(&mut self.partial);
+            self.partial_rows = 0;
+            self.partial_col = 0;
             write!(out, "{}", self.render_line(&(partial + "\n")))?;
         }
         let buffered = self.flush_buffered_table();
@@ -1254,21 +1279,63 @@ impl StreamingMarkdownRenderer {
             return Ok(());
         }
 
-        let display_len = self.pad.width() + self.partial.width();
-        let width = self.term_width();
-        let rows = usize::max(1, display_len.div_ceil(width));
-
-        if rows <= 1 {
+        // Use the row count we've been tracking incrementally as bytes were
+        // emitted — this is robust against terminal resize because each
+        // wrap was decided using the width that was live at the moment
+        // each character actually hit the terminal. Querying width here
+        // (the old approach) would mis-compute on any mid-stream resize
+        // and on hosts where `/dev/tty` reports a width different from the
+        // one in effect when the bytes were originally written.
+        if self.partial_rows == 0 {
             write!(out, "\r\x1b[K")?;
         } else {
-            write!(out, "\x1b[{}A\r\x1b[J", rows - 1)?;
+            write!(out, "\x1b[{}A\r\x1b[J", self.partial_rows)?;
         }
         Ok(())
+    }
+
+    /// Advance `partial_col` / `partial_rows` to reflect having written
+    /// `text` to the terminal at the current `term_width()`. Combining
+    /// marks (zero-width) are skipped. A character that doesn't fit in
+    /// the remaining columns wraps to the next row before being placed —
+    /// matching xterm-style auto-wrap with the cursor advancing past the
+    /// glyph's cells. This is called immediately after each `write!` of
+    /// raw partial bytes so the snapshot stays in lock-step with what
+    /// the terminal actually drew.
+    fn advance_partial_position(&mut self, text: &str) {
+        let width = self.term_width();
+        if width == 0 {
+            return;
+        }
+        for c in text.chars() {
+            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+            if w == 0 {
+                continue;
+            }
+            if self.partial_col + w > width {
+                self.partial_rows += 1;
+                self.partial_col = 0;
+            }
+            self.partial_col += w;
+        }
     }
 
     fn term_width(&self) -> usize {
         if let Some(width) = self.term_width_override {
             return width.max(1);
+        }
+        // Honor an explicit COLUMNS env var (set by hosts that pipe stdio
+        // to a child and want the child to use the host's notion of the
+        // terminal width). This takes precedence over `/dev/tty` because
+        // the host's measurement reflects the real surface where output
+        // will be displayed; the child's `/dev/tty` query may diverge in
+        // edge cases (multiplexers, pipes through wrappers).
+        if let Some(width) = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+        {
+            return width;
         }
         terminal::size()
             .map(|(columns, _)| usize::from(columns.max(1)))
@@ -1278,6 +1345,16 @@ impl StreamingMarkdownRenderer {
     #[doc(hidden)]
     pub fn set_term_width_override_for_tests(&mut self, width: usize) {
         self.term_width_override = Some(width);
+    }
+
+    #[doc(hidden)]
+    pub fn partial_rows_for_tests(&self) -> usize {
+        self.partial_rows
+    }
+
+    #[doc(hidden)]
+    pub fn partial_col_for_tests(&self) -> usize {
+        self.partial_col
     }
 }
 
@@ -1328,5 +1405,192 @@ mod visible_width_tests {
     fn ansi_escapes_are_stripped_before_counting() {
         assert_eq!(visible_width("\x1b[1mbold\x1b[0m"), 4);
         assert_eq!(visible_width("\x1b[38;2;255;0;0m🇺🇸\x1b[0m hi"), 5);
+    }
+}
+
+#[cfg(test)]
+mod erase_partial_tests {
+    //! Regression coverage for the partial-redraw race that surfaced as a
+    //! visible "duplicate paragraph" in scrollback (one wrap row of raw
+    //! markdown left behind above the rendered version).
+    //!
+    //! The pre-fix `erase_partial` queried `terminal::size()` at flush
+    //! time and divided the partial's display length by that value. When
+    //! the terminal width seen at flush time was wider than the width
+    //! that was live when the partial bytes were originally emitted (a
+    //! resize, or `/dev/tty` returning a different value than the host's
+    //! `process.stdout.columns`), the row count under-estimated and the
+    //! cursor-up sequence didn't reach the start of the wrapped region —
+    //! `\r\x1b[K` then only cleared the bottom row.
+    //!
+    //! The fix is to track the partial's row count incrementally as
+    //! bytes are written, using the width that was live at each emit.
+
+    use super::*;
+
+    fn extract_erase_seq(out: &[u8]) -> Option<String> {
+        // The interesting prefix of a flush is the cursor-up + clear.
+        // Either `\r\x1b[K` (single-row partial) or `\x1b[<n>A\r\x1b[J`
+        // (multi-row). Find whichever appears first in the stream.
+        let s = String::from_utf8_lossy(out);
+        // Search for either prefix.
+        let candidates = [("\r\x1b[K", 4usize)];
+        for (needle, len) in candidates {
+            if let Some(idx) = s.find(needle) {
+                return Some(s[idx..idx + len].to_string());
+            }
+        }
+        // Multi-row form `\x1b[<n>A\r\x1b[J`.
+        let mut i = 0;
+        let bytes = s.as_bytes();
+        while i + 2 < bytes.len() {
+            if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+                let mut j = i + 2;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'A' {
+                    // Look for trailing `\r\x1b[J`.
+                    let tail_start = j + 1;
+                    let tail = "\r\x1b[J".as_bytes();
+                    if bytes.len() >= tail_start + tail.len()
+                        && &bytes[tail_start..tail_start + tail.len()] == tail
+                    {
+                        let end = tail_start + tail.len();
+                        return Some(String::from_utf8_lossy(&bytes[i..end]).into_owned());
+                    }
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    #[test]
+    fn partial_row_count_matches_width_when_paragraph_wraps() {
+        // 135-cell wide pane, 170 char ASCII partial → wraps to 2 rows.
+        let mut r = StreamingMarkdownRenderer::new(2, false, true);
+        r.set_term_width_override_for_tests(135);
+
+        let mut out = Vec::<u8>::new();
+        // Stream the partial in two chunks (no \n yet).
+        let part_a: String = "a".repeat(100);
+        let part_b: String = "b".repeat(70);
+        r.write_chunk(&part_a, &mut out).unwrap();
+        r.write_chunk(&part_b, &mut out).unwrap();
+
+        // pad (2) + 100 a + 70 b = 172 cells. At width 135: ceil(172/135) = 2 rows.
+        assert_eq!(
+            r.partial_rows_for_tests(),
+            1,
+            "should be 1 row above bottom"
+        );
+        assert!(r.partial_col_for_tests() < 135);
+    }
+
+    #[test]
+    fn partial_redraw_steps_up_one_row_for_two_row_partial() {
+        let mut r = StreamingMarkdownRenderer::new(2, false, true);
+        r.set_term_width_override_for_tests(135);
+
+        let mut out = Vec::<u8>::new();
+        // Build a 170-char partial that wraps to 2 rows on a 135-col term.
+        r.write_chunk(&"x".repeat(170), &mut out).unwrap();
+        out.clear();
+
+        // Now feed a `\n` — triggers erase_partial.
+        r.write_chunk("\n", &mut out).unwrap();
+        let seq = extract_erase_seq(&out).expect("erase sequence emitted");
+        assert_eq!(seq, "\x1b[1A\r\x1b[J", "must step up to start of wrap");
+    }
+
+    #[test]
+    fn resize_after_emit_does_not_break_redraw() {
+        // Emit at width 135 (wraps to 2 rows), then "resize" wider before
+        // the \n arrives. Pre-fix: erase_partial would query the current
+        // (wider) width, see display_len < width, emit just `\r\x1b[K`,
+        // and leave the top wrap row stranded. Post-fix: row count was
+        // captured at emit time, so the up-step is preserved.
+        let mut r = StreamingMarkdownRenderer::new(2, false, true);
+        r.set_term_width_override_for_tests(135);
+
+        let mut out = Vec::<u8>::new();
+        r.write_chunk(&"x".repeat(170), &mut out).unwrap();
+
+        // Simulate a resize to a much wider terminal.
+        r.set_term_width_override_for_tests(300);
+        out.clear();
+
+        r.write_chunk("\n", &mut out).unwrap();
+        let seq = extract_erase_seq(&out).expect("erase sequence emitted");
+        assert_eq!(
+            seq, "\x1b[1A\r\x1b[J",
+            "row count must reflect width-at-emit, not width-at-flush"
+        );
+    }
+
+    #[test]
+    fn single_row_partial_uses_cr_clear() {
+        let mut r = StreamingMarkdownRenderer::new(2, false, true);
+        r.set_term_width_override_for_tests(135);
+
+        let mut out = Vec::<u8>::new();
+        r.write_chunk("hello world", &mut out).unwrap();
+        out.clear();
+
+        r.write_chunk("\n", &mut out).unwrap();
+        let seq = extract_erase_seq(&out).expect("erase sequence emitted");
+        assert_eq!(seq, "\r\x1b[K");
+    }
+
+    #[test]
+    fn three_row_partial_steps_up_two() {
+        let mut r = StreamingMarkdownRenderer::new(2, false, true);
+        r.set_term_width_override_for_tests(50);
+
+        let mut out = Vec::<u8>::new();
+        // pad(2) + 130 chars = 132 cells. At width 50: ceil(132/50) = 3 rows.
+        r.write_chunk(&"x".repeat(130), &mut out).unwrap();
+        assert_eq!(r.partial_rows_for_tests(), 2);
+        out.clear();
+
+        r.write_chunk("\n", &mut out).unwrap();
+        let seq = extract_erase_seq(&out).expect("erase sequence emitted");
+        assert_eq!(seq, "\x1b[2A\r\x1b[J");
+    }
+
+    #[test]
+    fn columns_env_var_is_honored_when_no_override() {
+        // term_width_override takes precedence; clear it and verify
+        // COLUMNS is consulted before falling back to /dev/tty / 80.
+        let mut r = StreamingMarkdownRenderer::new(0, false, true);
+        // SAFETY: tests in this module are not executed in parallel with
+        // other tests touching the COLUMNS env var.
+        // SAFETY: tests run single-threaded under `cargo test -- --test-threads=1`
+        // for this module; in parallel runs, the env var is restored
+        // before the test exits and other tests use the override path.
+        unsafe { std::env::set_var("COLUMNS", "200") };
+
+        let mut out = Vec::<u8>::new();
+        // 150 chars at COLUMNS=200 fits in 1 row (no wrap).
+        r.write_chunk(&"x".repeat(150), &mut out).unwrap();
+        assert_eq!(r.partial_rows_for_tests(), 0);
+
+        unsafe { std::env::remove_var("COLUMNS") };
+    }
+
+    #[test]
+    fn paragraph_break_resets_partial_position() {
+        let mut r = StreamingMarkdownRenderer::new(2, false, true);
+        r.set_term_width_override_for_tests(50);
+
+        let mut out = Vec::<u8>::new();
+        r.write_chunk(&"x".repeat(130), &mut out).unwrap();
+        assert_eq!(r.partial_rows_for_tests(), 2);
+
+        // \n flushes the partial. New partial is empty → counters reset.
+        r.write_chunk("\n", &mut out).unwrap();
+        assert_eq!(r.partial_rows_for_tests(), 0);
+        assert_eq!(r.partial_col_for_tests(), 0);
     }
 }
