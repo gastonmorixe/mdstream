@@ -31,7 +31,7 @@ mdstream takes the **opposite approach**. Raw partial lines stream straight to t
 - 🌊 **Hybrid streaming**: raw character echo while bytes arrive, full re-render the moment a newline lands. EOF flushes any unterminated tail.
 - 🎨 **24-bit true color**: heading levels, list bullets, code highlighting, link styles, and table separators all carry SGR colors.
 - 📰 **Six heading levels**: distinct color for each. H1 underlined with `━`, H2 with a dimmed `─`, H3-H6 bold-colored only.
-- 📋 **Lists**: depth-rotating bullets (`•◦▪‣`), vertical indent guides, hierarchical ordered numbering (write `1.2.3. Section` literally and it renders), task checkboxes (`☑` / `☐`), and continuation-line alignment.
+- 📋 **Lists**: depth-rotating bullets (`•◦▪‣`), vertical indent guides, hierarchical ordered numbering (write `1.2.3. Section` literally and it renders), task checkboxes (`✔` / `☐`), and continuation-line alignment.
 - 📊 **Pipe tables**: promotion on the separator row, in-place repaint as new rows arrive, three alignment modes (left, right, center), and Unicode-correct column widths.
 - 💻 **Fenced code blocks**: `syntect`-backed highlighting with bundled built-in themes, vendored third-party themes, a custom mdstream house theme, foreground-only rendering by default, optional themed backgrounds, optional line numbers, and language-specific label colors for ~30 common languages including Rust, Python, JS/TS, Go, Ruby, Java, Swift, Bash, Zig, Elixir, Haskell, and friends.
 - ✨ **Inline formatting**: bold, italic, bold+italic, strikethrough, code spans, links, images, autolinks, bare URLs (with adjacency guard), and backslash escapes for the full Markdown punctuation set.
@@ -106,7 +106,7 @@ mdstream --code-background < README.md
 | Horizontal rule | `---` | dim 40-char `─` |
 | Unordered list | `- item` | depth-rotating bullet (`•◦▪‣`) with vertical guides |
 | Ordered list | `1. item` | bold marker; literal `1.2.3.` is also accepted |
-| Task list | `- [x] done` | green `☑` / dim `☐` |
+| Task list | `- [x] done` | green `✔` / dim `☐` |
 | Blockquote | `> quoted` | dim `│` prefix, depth-aware |
 | Code span | `` `code` `` | bold violet accent, no background |
 | Bold | `**text**` | bold |

@@ -1140,7 +1140,7 @@ impl StreamingMarkdownRenderer {
                 .eq_ignore_ascii_case("x");
             let body = captures.get(4).map(|m| m.as_str()).unwrap_or_default();
             let checkbox = if checked {
-                format!("{BRIGHT_GREEN}{BOLD}☑{RESET}")
+                format!("{BRIGHT_GREEN}{BOLD}✔{RESET}")
             } else {
                 format!("{DIM}☐{RESET}")
             };

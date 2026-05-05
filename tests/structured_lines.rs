@@ -13,7 +13,7 @@ fn renders_basic_structures() {
     );
     assert_eq!(
         strip_ansi(&renderer.render_line("- [x] done\n")),
-        "  ☑ done\n"
+        "  ✔ done\n"
     );
     assert_eq!(strip_ansi(&renderer.render_line("- item\n")), "  • item\n");
     assert_eq!(
