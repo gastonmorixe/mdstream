@@ -1573,11 +1573,24 @@ impl StreamingMarkdownRenderer {
             }
         }
 
-        // If table-fit is on AND we can measure the live terminal,
-        // re-allocate column widths against that target. Otherwise
-        // fall back to the natural widths (existing behavior).
+        // `--table-fit` is a *max-width* constraint, not a fill. If
+        // we can measure the live terminal AND the natural table
+        // would overflow it, re-allocate column widths against that
+        // target. Otherwise (no live width, or natural already fits)
+        // use the content-only widths so small tables render at
+        // their natural size — same as if fit-mode were off.
         let widths = if let Some(target_total) = self.detect_table_fit_width() {
-            self.fitted_column_widths(&styled_header, &styled_rows, &natural, target_total)
+            let overhead = if num_cols == 0 {
+                0
+            } else {
+                2 * num_cols + (num_cols - 1)
+            };
+            let natural_total = natural.iter().sum::<usize>() + overhead;
+            if natural_total <= target_total {
+                natural
+            } else {
+                self.fitted_column_widths(&styled_header, &styled_rows, &natural, target_total)
+            }
         } else {
             natural
         };

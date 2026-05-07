@@ -4,6 +4,12 @@ All notable changes to `mdstream` are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-06
+
+### Fixed
+
+- `--table-fit` is now a *max-width* constraint instead of a fill: tables whose natural width fits inside `terminal_width + table_width_offset - padding` render at their natural size (matching the no-fit default), and the fit/squeeze allocator only engages when the natural table would overflow. The 0.3.0 behavior of unconditionally expanding every table to fill the terminal — even a tiny `| A | B |` ballooning to 80 columns — was the wrong default. The `--table-fit` and `--table-width-offset` `--help` strings were updated to match.
+
 ## [0.3.0] - 2026-05-06
 
 ### Added

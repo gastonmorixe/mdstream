@@ -71,7 +71,7 @@ pub struct Cli {
         long,
         env = "MDSTREAM_TABLE_FIT",
         default_value_t = false,
-        help = "Expand tables to the live terminal width with soft-wrapped cells (auto-disables when not a TTY)"
+        help = "Cap tables at the live terminal width; soft-wrap cells only when the natural table would overflow (auto-disables when not a TTY)"
     )]
     pub table_fit: bool,
 
@@ -80,7 +80,7 @@ pub struct Cli {
         env = "MDSTREAM_TABLE_WIDTH_OFFSET",
         default_value_t = 0,
         allow_negative_numbers = true,
-        help = "Cells to add (+) or subtract (-) from the table-fit target width; e.g. -10 leaves a 10-cell right gutter"
+        help = "Cells to add (+) or subtract (-) from the table-fit cap width; e.g. -10 leaves a 10-cell right gutter"
     )]
     pub table_width_offset: i32,
 }

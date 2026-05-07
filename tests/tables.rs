@@ -186,9 +186,10 @@ fn table_fit_disabled_keeps_content_width() {
 }
 
 #[test]
-fn table_fit_expands_table_to_terminal_width() {
-    // When the natural table is narrower than the terminal, fit-mode
-    // expands every row to fill the width exactly.
+fn table_fit_keeps_small_tables_at_natural_width() {
+    // `--table-fit` is a *max* constraint, not a fill: tables whose
+    // natural width is below the terminal width render at their
+    // natural size, just like if fit-mode were off.
     let rendered = render_table_fit(
         &[
             "| A | B |\n",
@@ -207,35 +208,75 @@ fn table_fit_expands_table_to_terminal_width() {
 
     assert!(!table_lines.is_empty(), "no table lines: {rendered:?}");
     for line in &table_lines {
+        assert!(
+            visible_width(line) < 60,
+            "small table should NOT expand to fill: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn table_fit_caps_overflowing_table_at_terminal_width() {
+    // When the natural table would overflow, fit-mode caps it at
+    // exactly the terminal width and soft-wraps cells.
+    let rendered = render_table_fit(
+        &[
+            "| Tag | Description |\n",
+            "|---|---|\n",
+            "| ok | one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen |\n",
+        ],
+        40,
+        0,
+    );
+    let table_lines: Vec<&str> = rendered
+        .split('\n')
+        .filter(|l| l.contains('│') || l.contains('┿') || l.contains('┼'))
+        .collect();
+    assert!(!table_lines.is_empty(), "no table lines: {rendered:?}");
+    for line in &table_lines {
         assert_eq!(
             visible_width(line),
-            60,
-            "table line should fill 60 cols: {line:?}"
+            40,
+            "overflowing table should be capped at 40 cols: {line:?}"
         );
     }
 }
 
 #[test]
 fn table_fit_offset_subtracts_columns() {
-    // Negative offset leaves a right gutter; the table fills
-    // (term_width + offset) cells.
+    // Negative offset leaves a right gutter; an overflowing table
+    // is capped at (term_width + offset) cells.
     let rendered = render_table_fit(
-        &["| A | B | C |\n", "|---|---|---|\n", "| 1 | 2 | 3 |\n"],
+        &[
+            "| A | B | C |\n",
+            "|---|---|---|\n",
+            "| 1 | aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp | 3 |\n",
+        ],
         80,
         -10,
     );
+    let mut saw_row = false;
     for line in rendered.split('\n').filter(|l| l.contains('│')) {
+        saw_row = true;
         assert_eq!(visible_width(line), 70);
     }
+    assert!(saw_row, "no body row: {rendered:?}");
 }
 
 #[test]
 fn table_fit_offset_can_be_positive() {
     // Positive offset over-expands beyond the detected width — symmetric
-    // with the negative path; we don't clamp because some hosts
-    // intentionally over-draw (e.g. embedded panels with their own
-    // gutter).
-    let rendered = render_table_fit(&["| A | B |\n", "|---|---|\n", "| x | y |\n"], 50, 5);
+    // with the negative path. Triggered via overflowing content so the
+    // max-mode allocator actually engages.
+    let rendered = render_table_fit(
+        &[
+            "| A | B |\n",
+            "|---|---|\n",
+            "| x | aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn |\n",
+        ],
+        50,
+        5,
+    );
     for line in rendered.split('\n').filter(|l| l.contains('│')) {
         assert_eq!(visible_width(line), 55);
     }
@@ -405,24 +446,25 @@ fn table_fit_target_zero_or_negative_falls_back() {
 #[test]
 fn table_fit_re_detects_width_each_render() {
     // Spec: "no resizing, this is just a one off calculation at the
-    // time each table is rendered." Two consecutive tables with
-    // different `term_width_override` values must be sized
-    // independently — i.e. the second table picks up the new width.
+    // time each table is rendered." Two consecutive overflowing
+    // tables with different `term_width_override` values must be
+    // sized independently — i.e. the second table picks up the new
+    // width.
     let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
     renderer.set_table_fit(true);
 
-    // First table at 60 cols.
-    renderer.set_term_width_override_for_tests(60);
+    // First overflowing table at 30 cols.
+    renderer.set_term_width_override_for_tests(30);
     let _ = renderer.render_line("| A | B |\n");
     let _ = renderer.render_line("|---|---|\n");
-    let _ = renderer.render_line("| one | two |\n");
+    let _ = renderer.render_line("| one | aaaa bbbb cccc dddd eeee ffff gggg |\n");
     let first = strip_ansi(&renderer.render_line("\n"));
 
-    // Second table at 100 cols.
-    renderer.set_term_width_override_for_tests(100);
+    // Second overflowing table at 50 cols.
+    renderer.set_term_width_override_for_tests(50);
     let _ = renderer.render_line("| C | D |\n");
     let _ = renderer.render_line("|---|---|\n");
-    let _ = renderer.render_line("| three | four |\n");
+    let _ = renderer.render_line("| three | wwww xxxx yyyy zzzz aaaa bbbb cccc dddd eeee ffff |\n");
     let second = strip_ansi(&renderer.render_line("after\n"));
 
     let first_w = first
@@ -437,8 +479,8 @@ fn table_fit_re_detects_width_each_render() {
         .map(visible_width)
         .next()
         .unwrap();
-    assert_eq!(first_w, 60);
-    assert_eq!(second_w, 100);
+    assert_eq!(first_w, 30);
+    assert_eq!(second_w, 50);
 }
 
 #[test]
@@ -448,7 +490,7 @@ fn table_fit_propagates_styling_across_wrapped_lines() {
     // contains a `\x1b[1m` marker on the second visual line of the
     // wrapped header.
     let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
-    renderer.set_term_width_override_for_tests(40);
+    renderer.set_term_width_override_for_tests(24);
     renderer.set_table_fit(true);
 
     let _ = renderer.render_line("| Population (millions) | X |\n");
@@ -513,10 +555,10 @@ fn table_fit_squeeze_branch_handles_too_narrow_target() {
 // --- column-allocation algorithm: white-box checks via the public render path ---
 
 #[test]
-fn table_fit_distributes_slack_proportional_to_max_widths() {
-    // Two columns: short and long. With ample slack the long column
-    // absorbs more of the expansion than the short one, mirroring CSS
-    // table-layout: auto behavior.
+fn table_fit_max_mode_does_not_widen_short_tables() {
+    // Under the max-not-fill semantic, a small two-column table never
+    // expands beyond its natural width even with ample terminal
+    // slack. Both columns stay at their content-only sizes.
     let rendered = render_table_fit(
         &["| S | LongerColumn |\n", "|---|---|\n", "| 1 | text |\n"],
         60,
@@ -526,12 +568,18 @@ fn table_fit_distributes_slack_proportional_to_max_widths() {
         .split('\n')
         .find(|l| l.contains('│') && l.contains('1'))
         .unwrap();
+    assert!(
+        visible_width(body) < 60,
+        "max-mode widened a fitting table: {body:?}"
+    );
+    // The wider column is naturally wider than the short one — no
+    // expansion happened, but the natural shape is preserved.
     let cells: Vec<&str> = body.split('│').collect();
     assert_eq!(cells.len(), 2);
     let short_len = visible_width(cells[0]);
     let long_len = visible_width(cells[1]);
     assert!(
-        long_len > short_len * 2,
-        "long column should absorb more slack: short={short_len} long={long_len}"
+        long_len > short_len,
+        "natural shape lost: short={short_len} long={long_len}"
     );
 }

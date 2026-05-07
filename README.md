@@ -132,8 +132,8 @@ mdstream takes flags or environment variables. **Flags win** when both are set.
 | `--inline-code-color COLOR` | `MDSTREAM_INLINE_CODE_COLOR` | `h5` | Inline code accent from the `h1`-`h6` palette |
 | `--code-background` | `MDSTREAM_CODE_BACKGROUND` | off | Enable themed backgrounds in fenced code blocks |
 | `--no-code-background` | `MDSTREAM_NO_CODE_BACKGROUND` | off | Disable themed backgrounds in fenced code blocks |
-| `--table-fit` | `MDSTREAM_TABLE_FIT` | off | Expand tables to the live terminal width with soft-wrapped cells (auto-disables when no width can be detected) |
-| `--table-width-offset N` | `MDSTREAM_TABLE_WIDTH_OFFSET` | `0` | Cells to add (+) or subtract (-) from the table-fit target width |
+| `--table-fit` | `MDSTREAM_TABLE_FIT` | off | Cap tables at the live terminal width, soft-wrapping cells only when the natural table would overflow (auto-disables when no width can be detected) |
+| `--table-width-offset N` | `MDSTREAM_TABLE_WIDTH_OFFSET` | `0` | Cells to add (+) or subtract (-) from the table-fit cap width |
 
 Run `mdstream --help` for the full surface.
 
