@@ -4,6 +4,10 @@ All notable changes to `mdstream` are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Tables with ragged rows (a row whose cell count differs from the header) no longer break the rest of the table. Previously, the first mismatched row flushed the table early and every subsequent row — *including rows that DID match the header* — rendered as raw `| cell | cell |` markdown text, because re-entering table mode requires a fresh `|---|` separator that the input doesn't have. New GFM-compatible behavior: ragged rows stay inside the table; missing trailing cells render blank, extra cells are dropped. Reported via `tmp/make-a-detailed-plan-virtual-dusk.md` where row 13 of a 4-column table omitted its `| Source |` cell and torpedoed rows 13 onward. Regression test: `ragged_rows_keep_table_open` in `tests/tables.rs`.
+
 ## [0.3.2] - 2026-05-06
 
 ### Fixed

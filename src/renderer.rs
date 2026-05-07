@@ -1344,14 +1344,21 @@ impl StreamingMarkdownRenderer {
     }
 
     fn render_after_active_table(&mut self, stripped: &str) -> String {
+        // GFM: rows whose cell count differs from the header are still
+        // valid — missing cells are filled blank, extras are dropped.
+        // The strict `row.len() == header.len()` guard we used to apply
+        // here would bail out of the table on the first mismatched row,
+        // and because no fresh `|---|` separator follows, every later
+        // row would render as raw markdown via `render_structured_line`.
+        // See `tables.rs::ragged_rows_keep_table_open` for the
+        // regression test.
         let row_cells = split_table_row(stripped);
         let header_cells = self
             .table_lines
             .first()
             .and_then(|line| split_table_row(line));
 
-        if let (Some(row_cells), Some(header_cells)) = (row_cells, header_cells)
-            && row_cells.len() == header_cells.len()
+        if let (Some(_), Some(_)) = (row_cells, header_cells)
             && parse_table_separator(stripped).is_none()
         {
             self.table_lines.push(stripped.to_owned());
@@ -1556,13 +1563,26 @@ impl StreamingMarkdownRenderer {
     fn render_table(&self) -> String {
         let header = split_table_row(self.table_lines.first().expect("table header should exist"))
             .expect("table header should parse");
+        let num_cols = header.len();
+        // GFM-style: ragged rows are normalized to the header's column
+        // count — missing cells are filled with empty strings, extras
+        // are dropped. `render_table_row` indexes `widths[idx]` and
+        // `alignments[col_idx]`, so every row MUST be exactly `num_cols`
+        // wide before it reaches the styling/width pipeline.
         let body_rows: Vec<Vec<String>> = self
             .table_lines
             .iter()
             .skip(2)
             .filter_map(|line| split_table_row(line))
+            .map(|mut row| {
+                if row.len() < num_cols {
+                    row.resize(num_cols, String::new());
+                } else if row.len() > num_cols {
+                    row.truncate(num_cols);
+                }
+                row
+            })
             .collect();
-        let num_cols = header.len();
 
         let styled_header: Vec<String> = header
             .iter()

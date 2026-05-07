@@ -80,6 +80,63 @@ fn candidate_clears_if_not_promoted() {
 }
 
 #[test]
+fn ragged_rows_keep_table_open() {
+    // Regression for `tmp/make-a-detailed-plan-virtual-dusk.md`: when the
+    // user authored row 13 of a 4-column table with only 3 cells (a
+    // missing trailing `| Source |`), pre-fix mdstream flushed the
+    // table on that row AND every later 4-cell row rendered as raw
+    // markdown text — because once we exit table mode, the only way to
+    // re-enter is via a fresh `|---|` separator, which the input
+    // doesn't have.
+    //
+    // GFM behavior: ragged rows are normalized to the header column
+    // count — missing cells render blank, extras are dropped. The
+    // table stays open until a non-row line (blank line, prose, etc.)
+    // closes it.
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+    renderer.set_term_width_override_for_tests(120);
+
+    let _ = renderer.render_line("| # | Q | Interpretation | Source |\n");
+    let _ = renderer.render_line("|---|---|---|---|\n");
+    let _ = renderer.render_line("| 1 | a | aye | user |\n");
+    // Row missing trailing cell — only 3 cells.
+    let _ = renderer.render_line("| 2 | b | bee |\n");
+    // Row with extra cell — 5 cells; extra is dropped.
+    let _ = renderer.render_line("| 3 | c | cee | mine | extra |\n");
+    let _ = renderer.render_line("| 4 | d | dee | user |\n");
+    let closed = strip_ansi(&renderer.render_line("after\n"));
+
+    // No raw markdown should leak.
+    for marker in ["| 2 |", "| 3 |", "| 4 |"] {
+        assert!(
+            !closed.contains(marker),
+            "ragged row leaked as raw markdown ({marker:?}): {closed:?}"
+        );
+    }
+    // All four data rows must appear inside the rendered table.
+    for token in ["aye", "bee", "cee", "dee"] {
+        assert!(
+            closed.contains(token),
+            "missing row content {token:?}: {closed:?}"
+        );
+    }
+    // The "extra" cell from row 3 is truncated.
+    assert!(
+        !closed.contains("extra"),
+        "extra cell should be dropped, not rendered: {closed:?}"
+    );
+    // The dropped-trailing-cell on row 2 leaves the Source column blank
+    // but the column dividers still align — i.e. we still have a
+    // single rendered table, not two flushes.
+    let table_starts = closed.matches('━').count();
+    assert!(
+        table_starts > 0,
+        "expected a single rendered table separator: {closed:?}"
+    );
+    assert!(closed.ends_with("after\n"));
+}
+
+#[test]
 fn table_accepts_escaped_pipes_inside_code_spans() {
     let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
     renderer.set_term_width_override_for_tests(160);

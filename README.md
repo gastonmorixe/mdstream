@@ -186,7 +186,7 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-The test suite is **58 tests** across seven integration files plus in-crate unit tests: streaming chunk handling, every block-level renderer, inline formatting, the table promotion and repaint state machine, fenced code blocks, the CLI surface, the TTY-detection branch, and an *end-to-end snapshot* of a mixed-content document.
+The test suite is **85 tests** across seven integration files plus in-crate unit tests: streaming chunk handling, every block-level renderer, inline formatting, the table promotion and repaint state machine, fenced code blocks, the CLI surface, the TTY-detection branch, and an *end-to-end snapshot* of a mixed-content document.
 
 ## Contributing
 
