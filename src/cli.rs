@@ -13,7 +13,9 @@ pub struct Cli {
         long,
         env = "MDSTREAM_PADDING",
         default_value_t = 0,
-        help = "Left padding in spaces"
+        value_name = "SPACES",
+        help_heading = "Display",
+        help = "Left padding in spaces."
     )]
     pub padding: usize,
 
@@ -21,7 +23,8 @@ pub struct Cli {
         long,
         env = "MDSTREAM_NO_LINENO",
         default_value_t = false,
-        help = "Disable fenced-code line numbers"
+        help_heading = "Display",
+        help = "Disable fenced-code line numbers."
     )]
     pub no_lineno: bool,
 
@@ -29,7 +32,8 @@ pub struct Cli {
         long,
         env = "MDSTREAM_NO_LIST_GUIDES",
         default_value_t = false,
-        help = "Disable vertical indent guides for nested lists"
+        help_heading = "Display",
+        help = "Disable vertical indent guides for nested lists."
     )]
     pub no_list_guides: bool,
 
@@ -37,7 +41,8 @@ pub struct Cli {
         long,
         env = "MDSTREAM_THEME",
         default_value_t = DEFAULT_CODE_THEME,
-        help = "Code theme for fenced code blocks"
+        help_heading = "Code highlighting",
+        help = "Code theme for fenced code blocks."
     )]
     pub theme: CodeTheme,
 
@@ -45,7 +50,9 @@ pub struct Cli {
         long,
         env = "MDSTREAM_INLINE_CODE_COLOR",
         default_value_t = DEFAULT_INLINE_CODE_COLOR,
-        help = "Inline code accent color from the h1-h6 palette"
+        value_name = "COLOR",
+        help_heading = "Code highlighting",
+        help = "Inline code accent color from the h1-h6 palette."
     )]
     pub inline_code_color: PaletteColor,
 
@@ -54,7 +61,8 @@ pub struct Cli {
         env = "MDSTREAM_CODE_BACKGROUND",
         default_value_t = false,
         conflicts_with = "no_code_background",
-        help = "Enable themed backgrounds in fenced code blocks"
+        help_heading = "Code highlighting",
+        help = "Enable themed backgrounds in fenced code blocks."
     )]
     pub code_background: bool,
 
@@ -63,7 +71,8 @@ pub struct Cli {
         env = "MDSTREAM_NO_CODE_BACKGROUND",
         default_value_t = false,
         conflicts_with = "code_background",
-        help = "Disable themed backgrounds in fenced code blocks"
+        help_heading = "Code highlighting",
+        help = "Disable themed backgrounds in fenced code blocks."
     )]
     pub no_code_background: bool,
 
@@ -71,7 +80,8 @@ pub struct Cli {
         long,
         env = "MDSTREAM_TABLE_FIT",
         default_value_t = false,
-        help = "Cap tables at the live terminal width; soft-wrap cells only when the natural table would overflow (auto-disables when not a TTY)"
+        help_heading = "Tables",
+        help = "Cap tables at the live terminal width; soft-wrap cells only when the natural table would overflow (auto-disables when not a TTY)."
     )]
     pub table_fit: bool,
 
@@ -80,7 +90,9 @@ pub struct Cli {
         env = "MDSTREAM_TABLE_WIDTH_OFFSET",
         default_value_t = 0,
         allow_negative_numbers = true,
-        help = "Cells to add (+) or subtract (-) from the table-fit cap width; e.g. -10 leaves a 10-cell right gutter"
+        value_name = "CELLS",
+        help_heading = "Tables",
+        help = "Cells to add (+) or subtract (-) from the table-fit cap width; e.g. -10 leaves a 10-cell right gutter."
     )]
     pub table_width_offset: i32,
 }

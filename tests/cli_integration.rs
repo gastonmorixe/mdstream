@@ -183,3 +183,54 @@ fn binary_respects_inline_code_color_flag() {
     assert!(stdout.contains("\x1b[38;2;100;220;100m"));
     assert_eq!(strip_ansi(&stdout), "\ncode\n");
 }
+
+/// Cross-reference guard. Every long flag and `env =` declared on
+/// `mdstream::cli::Cli` MUST appear in the binary's rendered `--help`
+/// output. The hand-curated help screen in `src/help.rs` is now
+/// programmatically generated from the clap derive — this test makes
+/// sure that pipeline never silently drops anything (e.g. by a flag
+/// landing under a `help_heading` that isn't listed in `SECTION_ORDER`
+/// — those still surface under `Other`, but if someone ever rewires
+/// the renderer to filter sections, this test fails loudly).
+#[test]
+fn help_screen_lists_every_clap_flag_and_env() {
+    use clap::CommandFactory;
+
+    let cmd = mdstream::cli::Cli::command();
+    let output = Command::new(env!("CARGO_BIN_EXE_mdstream"))
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = strip_ansi(&String::from_utf8(output.stdout).unwrap());
+
+    let mut missing_flags: Vec<String> = Vec::new();
+    let mut missing_envs: Vec<String> = Vec::new();
+    for arg in cmd.get_arguments() {
+        if let Some(long) = arg.get_long() {
+            if matches!(long, "help" | "version") {
+                continue;
+            }
+            let needle = format!("--{long}");
+            if !stdout.contains(&needle) {
+                missing_flags.push(needle);
+            }
+        }
+        if let Some(env) = arg.get_env() {
+            let env = env.to_string_lossy().into_owned();
+            if !stdout.contains(&env) {
+                missing_envs.push(env);
+            }
+        }
+    }
+
+    assert!(
+        missing_flags.is_empty() && missing_envs.is_empty(),
+        "src/help.rs is out of sync with src/cli.rs.\n  \
+         Flags missing from --help: {missing_flags:?}\n  \
+         Env vars missing from --help: {missing_envs:?}"
+    );
+}

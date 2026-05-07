@@ -4,6 +4,19 @@ All notable changes to `mdstream` are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-05-06
+
+### Fixed
+
+- Single-column markdown tables (`| huge |\n|------|\n| body |`) are now promoted and rendered like any other table. The candidate regex required at least one inner pipe and `split_table_row` rejected rows below 2 cells, so 1-column tables silently leaked through as raw markdown source. Bug predates 0.3.0; uncovered by the `Single mega-cell` example in `tmp/markdown-tables-mock-002.md`.
+- `mdstream --help` now actually lists `--table-fit` / `--table-width-offset` and the matching `MDSTREAM_TABLE_FIT` / `MDSTREAM_TABLE_WIDTH_OFFSET` env vars. The hand-curated help screen in `src/help.rs` had been out of sync with the clap derive in `src/cli.rs` since 0.3.0 — both flags shipped without ever appearing in the rendered help.
+
+### Changed
+
+- The `## Flags` section of `--help` is now generated programmatically by introspecting `clap::Command::get_arguments()`. The clap derive in `src/cli.rs` is the single source of truth: edit a flag's `help`, `default_value_t`, `env`, or `value_name` there and the rendered help reflects it on next build, no `help.rs` edits needed.
+- Flags are grouped under headings (`Display`, `Code highlighting`, `Tables`) via `#[arg(help_heading = "...")]` on each clap arg. Each entry is a single line with help text, default, and env var, replacing the previous separate `## Environment` section.
+- New tests guarantee the pipeline can't silently drop entries: a unit test in `src/help.rs` and an integration test in `tests/cli_integration.rs` both walk every clap arg and assert each long flag and `env =` substring appears in the rendered output. CI fails if `src/cli.rs` ever drifts from what `--help` shows.
+
 ## [0.3.1] - 2026-05-06
 
 ### Fixed

@@ -150,7 +150,15 @@ fn ansi_re() -> &'static Regex {
 
 fn table_candidate_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\s*\|?.+\|.+\|?\s*$").unwrap())
+    RE.get_or_init(|| {
+        // Accept either:
+        //   - 1-column form: `| ... |` (both leading and trailing
+        //     pipes mandatory, otherwise we'd false-positive on prose
+        //     containing a single `|`),
+        //   - 2+ column GFM form: any line with at least one inner
+        //     pipe, leading/trailing pipes optional.
+        Regex::new(r"^\s*(?:\|.+\||\|?.+\|.+\|?)\s*$").unwrap()
+    })
 }
 
 fn table_separator_cell_re() -> &'static Regex {
@@ -242,10 +250,13 @@ fn ignored_html_wrapper_tag(line: &str) -> bool {
 }
 
 fn split_table_row(line: &str) -> Option<Vec<String>> {
-    let mut stripped = line.trim();
-    if !stripped.contains('|') {
+    let stripped_full = line.trim();
+    if !stripped_full.contains('|') {
         return None;
     }
+    let had_leading = stripped_full.starts_with('|');
+    let had_trailing = stripped_full.ends_with('|');
+    let mut stripped = stripped_full;
     if let Some(rest) = stripped.strip_prefix('|') {
         stripped = rest;
     }
@@ -290,7 +301,19 @@ fn split_table_row(line: &str) -> Option<Vec<String>> {
         current.push(ch);
     }
     cells.push(current.trim().to_owned());
-    if cells.len() < 2 { None } else { Some(cells) }
+    // Allow 1-cell rows ONLY when both leading and trailing pipes
+    // were present and the cell carries content — that's the
+    // canonical 1-column-table shape (`| huge |`, `|------|`).
+    // Otherwise require >= 2 cells, matching GFM's permissive form
+    // `A | B` where the outer pipes are optional.
+    let min_cells = if had_leading && had_trailing { 1 } else { 2 };
+    if cells.len() < min_cells {
+        return None;
+    }
+    if cells.len() == 1 && cells[0].is_empty() {
+        return None;
+    }
+    Some(cells)
 }
 
 fn parse_table_separator(line: &str) -> Option<Vec<Alignment>> {

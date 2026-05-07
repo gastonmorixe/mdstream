@@ -127,6 +127,66 @@ fn table_flushes_at_eof() {
     assert!(plain.contains(" one │ two "));
 }
 
+#[test]
+fn single_column_table_is_promoted_and_rendered() {
+    // Regression for `tmp/markdown-tables-mock-002.md` "Single mega-cell":
+    // 1-column tables ARE valid markdown (GFM, CommonMark Tables ext.,
+    // pandoc) but the candidate regex required >= 1 inner pipe and
+    // `split_table_row` rejected anything below 2 cells, so `| huge |`
+    // never promoted and the raw markdown leaked into output.
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+    renderer.set_term_width_override_for_tests(120);
+
+    let _ = renderer.render_line("| huge |\n");
+    let _ = renderer.render_line("|------|\n");
+    let _ = renderer.render_line("| short cell |\n");
+    let closed = strip_ansi(&renderer.render_line("after\n"));
+
+    assert!(
+        closed.contains('━'),
+        "expected horizontal rule from a promoted table: {closed:?}"
+    );
+    assert!(closed.contains("huge"), "header missing: {closed:?}");
+    assert!(closed.contains("short cell"), "body missing: {closed:?}");
+    // Raw markdown must NOT survive promotion.
+    assert!(
+        !closed.contains("| huge |"),
+        "raw markdown leaked: {closed:?}"
+    );
+    assert!(
+        !closed.contains("|------|"),
+        "raw separator leaked: {closed:?}"
+    );
+}
+
+#[test]
+fn single_column_mega_cell_caps_at_terminal_width_with_fit() {
+    // 1-col table with one very long body cell. Under --table-fit, the
+    // cell soft-wraps to the terminal cap and every visual row equals
+    // the target width — same contract as multi-column fit-mode.
+    let body = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu alpha bravo charlie delta echo";
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+    renderer.set_term_width_override_for_tests(60);
+    renderer.set_table_fit(true);
+
+    let _ = renderer.render_line("| huge |\n");
+    let _ = renderer.render_line("|------|\n");
+    let _ = renderer.render_line(&format!("| {body} |\n"));
+    let mut out = Vec::new();
+    renderer.finish(&mut out).unwrap();
+    let rendered = strip_ansi(std::str::from_utf8(&out).unwrap());
+
+    let table_rows: Vec<&str> = rendered.split('\n').filter(|l| !l.is_empty()).collect();
+    assert!(
+        table_rows.len() >= 3,
+        "expected header + rule + >=1 wrap row: {rendered:?}"
+    );
+    use unicode_width::UnicodeWidthStr;
+    for row in &table_rows {
+        assert_eq!(row.width(), 60, "row not 60 cells: {row:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Terminal-width-aware ("table-fit") rendering. Opt-in via
 // `set_table_fit(true)` (mirrors the `--table-fit` / `MDSTREAM_TABLE_FIT`
