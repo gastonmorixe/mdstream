@@ -5,7 +5,7 @@ use crate::theme::{
 use anyhow::Result;
 use crossterm::terminal;
 use regex::Regex;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -378,6 +378,305 @@ fn align_cell(text: &str, width: usize, alignment: Alignment) -> String {
     }
 }
 
+/// Return the visible width of the longest whitespace-delimited token
+/// inside `text`, ignoring ANSI escapes. Used to derive a column's
+/// minimum width for the table-fit allocator: a column wider than
+/// this can always wrap without breaking a word in half.
+fn longest_token_width(text: &str) -> usize {
+    let plain = ansi_re().replace_all(text, "");
+    plain
+        .split_whitespace()
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Indices into `widths` sorted descending by width — ties broken by
+/// natural index order. Used to pick the columns that should absorb
+/// rounding remainder when distributing slack.
+fn natural_indices_by_width(widths: &[usize]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..widths.len()).collect();
+    idx.sort_by(|a, b| widths[*b].cmp(&widths[*a]).then(a.cmp(b)));
+    idx
+}
+
+fn headroom_indices_by_size(headroom: &[usize]) -> Vec<usize> {
+    natural_indices_by_width(headroom)
+}
+
+/// Add `remainder` cells of width to `widths`, one cell per index in
+/// `order`, looping if `remainder` exceeds `order.len()`. Always
+/// terminates because `order` is non-empty when called.
+fn redistribute_remainder(widths: &mut [usize], order: &[usize], mut remainder: usize) {
+    if remainder == 0 || order.is_empty() {
+        return;
+    }
+    let mut i = 0;
+    while remainder > 0 {
+        widths[order[i % order.len()]] += 1;
+        remainder -= 1;
+        i += 1;
+    }
+}
+
+/// ANSI-aware soft word wrap. Returns a `Vec` of wrapped lines whose
+/// visible width is `<= width`, preserving the original ANSI escape
+/// sequences inline. Active SGR styling carries across wrap
+/// boundaries: each non-final line ends with `RESET` and the next
+/// line is prefixed with the concatenation of every ANSI escape seen
+/// since the last `RESET`, so a bold/colored cell that wraps stays
+/// bold/colored on every visual line. Words that exceed `width` are
+/// hard-broken at character boundaries (zero-width chars stay
+/// attached to the preceding cell). Whitespace runs at wrap points
+/// are dropped.
+///
+/// Behavior on edge inputs:
+/// - `width == 0` → returns `[""]` (the caller should not allocate
+///   zero-width columns, but we don't panic if it does).
+/// - empty `text` → returns `[""]`.
+/// - `text` already fits on one line → returns `[text]` verbatim.
+fn wrap_styled_cell(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    if visible_width(text) <= width {
+        return vec![text.to_owned()];
+    }
+
+    // Tokenize: ANSI escapes are zero-width passthroughs; non-ANSI
+    // chunks are split into whitespace runs vs non-whitespace
+    // ("word") runs. Each Word atom is broken further into
+    // (ansi-prefix, visible-glyph) pairs so we can hard-break inside
+    // the word while still threading any embedded SGR escapes
+    // through.
+    enum Atom<'a> {
+        Ansi(&'a str),
+        Space,
+        Word(Vec<WordPiece<'a>>, usize),
+    }
+    // (ansi escapes that immediately precede this glyph, the glyph
+    // itself, glyph visible width).
+    struct WordPiece<'a> {
+        prefix: String,
+        glyph: &'a str,
+        width: usize,
+    }
+
+    let ansi = ansi_re();
+
+    fn read_word_pieces<'a>(
+        text: &'a str,
+        start: usize,
+        end: usize,
+    ) -> (Vec<WordPiece<'a>>, usize) {
+        let mut pieces = Vec::new();
+        let mut total = 0usize;
+        let bytes = text.as_bytes();
+        let mut i = start;
+        let mut pending_prefix = String::new();
+        while i < end {
+            if bytes[i] == 0x1b
+                && let Some(m) = ansi_re().find_at(text, i)
+                && m.start() == i
+                && m.end() <= end
+            {
+                pending_prefix.push_str(&text[m.start()..m.end()]);
+                i = m.end();
+                continue;
+            }
+            let ch = text[i..].chars().next().unwrap();
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let glyph_end = i + ch.len_utf8();
+            pieces.push(WordPiece {
+                prefix: std::mem::take(&mut pending_prefix),
+                glyph: &text[i..glyph_end],
+                width: cw,
+            });
+            total += cw;
+            i = glyph_end;
+        }
+        // Trailing ANSI (e.g. a closing `\x1b[0m` right after the last
+        // glyph) becomes a zero-width "ghost" piece appended after the
+        // last visible glyph, so the closing escape is emitted *after*
+        // the glyph it logically closes — not before, which would flip
+        // the styling for that glyph.
+        if !pending_prefix.is_empty() {
+            pieces.push(WordPiece {
+                prefix: std::mem::take(&mut pending_prefix),
+                glyph: "",
+                width: 0,
+            });
+        }
+        (pieces, total)
+    }
+
+    let mut atoms: Vec<Atom<'_>> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < text.len() {
+        if bytes[i] == 0x1b
+            && let Some(m) = ansi.find_at(text, i)
+            && m.start() == i
+        {
+            atoms.push(Atom::Ansi(&text[m.start()..m.end()]));
+            i = m.end();
+            continue;
+        }
+        let ch = text[i..].chars().next().expect("non-empty remainder");
+        let ch_len = ch.len_utf8();
+        if ch.is_whitespace() {
+            let mut j = i + ch_len;
+            while j < text.len() && bytes[j] != 0x1b {
+                let nc = text[j..].chars().next().unwrap();
+                if !nc.is_whitespace() {
+                    break;
+                }
+                j += nc.len_utf8();
+            }
+            atoms.push(Atom::Space);
+            i = j;
+            continue;
+        }
+        // Word: read until next whitespace boundary, allowing ANSI
+        // escapes inside.
+        let start = i;
+        let mut j = i + ch_len;
+        while j < text.len() {
+            if bytes[j] == 0x1b
+                && let Some(m) = ansi.find_at(text, j)
+                && m.start() == j
+            {
+                j = m.end();
+                continue;
+            }
+            let nc = text[j..].chars().next().unwrap();
+            if nc.is_whitespace() {
+                break;
+            }
+            j += nc.len_utf8();
+        }
+        let (pieces, w) = read_word_pieces(text, start, j);
+        atoms.push(Atom::Word(pieces, w));
+        i = j;
+    }
+
+    // Track the "currently open" SGR escapes — the concatenation of
+    // every ANSI sequence seen since the last full reset
+    // (`\x1b[0m` / `\x1b[m`). Re-emitted at the start of every wrap
+    // continuation line so styles persist across visual rows.
+    let mut active_style = String::new();
+    let mut lines: Vec<String> = vec![String::new()];
+    let mut cur_w: usize = 0;
+    let mut needs_space = false;
+
+    let record_ansi = |active: &mut String, s: &str| {
+        if is_full_reset(s) {
+            active.clear();
+        } else {
+            active.push_str(s);
+        }
+    };
+
+    // Place a single visible glyph onto the current line, wrapping
+    // first if it doesn't fit. `piece.prefix` carries any ANSI
+    // escapes that came immediately before the glyph and must
+    // travel with it.
+    fn place_glyph(
+        lines: &mut Vec<String>,
+        active: &mut String,
+        cur_w: &mut usize,
+        needs_space: &mut bool,
+        piece: &WordPiece<'_>,
+        width: usize,
+    ) {
+        let prefix = piece.prefix.as_str();
+        let glyph = piece.glyph;
+        let gw = piece.width;
+        let sep = if *cur_w > 0 && *needs_space { 1 } else { 0 };
+        if *cur_w + sep + gw > width && *cur_w > 0 {
+            // Wrap.
+            lines.last_mut().unwrap().push_str(RESET);
+            lines.push(active.clone());
+            *cur_w = 0;
+            *needs_space = false;
+        }
+        if *cur_w > 0 && *needs_space {
+            lines.last_mut().unwrap().push(' ');
+            *cur_w += 1;
+            *needs_space = false;
+        }
+        // Track any SGR escapes inside the glyph's prefix.
+        if !prefix.is_empty() {
+            for m in ansi_re().find_iter(prefix) {
+                let esc = &prefix[m.start()..m.end()];
+                if is_full_reset(esc) {
+                    active.clear();
+                } else {
+                    active.push_str(esc);
+                }
+            }
+            lines.last_mut().unwrap().push_str(prefix);
+        }
+        lines.last_mut().unwrap().push_str(glyph);
+        *cur_w += gw;
+    }
+
+    for atom in &atoms {
+        match atom {
+            Atom::Ansi(s) => {
+                record_ansi(&mut active_style, s);
+                lines.last_mut().unwrap().push_str(s);
+            }
+            Atom::Space => {
+                if cur_w > 0 {
+                    needs_space = true;
+                }
+            }
+            Atom::Word(pieces, w) => {
+                let sep = if cur_w > 0 && needs_space { 1 } else { 0 };
+                if cur_w > 0 && cur_w + sep + w > width && *w <= width {
+                    // Whole word fits on a fresh line — wrap before
+                    // placing it (cleaner than mid-word break).
+                    lines.last_mut().unwrap().push_str(RESET);
+                    lines.push(active_style.clone());
+                    cur_w = 0;
+                    needs_space = false;
+                }
+                for piece in pieces {
+                    place_glyph(
+                        &mut lines,
+                        &mut active_style,
+                        &mut cur_w,
+                        &mut needs_space,
+                        piece,
+                        width,
+                    );
+                }
+                needs_space = true;
+            }
+        }
+    }
+    lines
+}
+
+/// True when `s` is an SGR sequence that resets all attributes —
+/// i.e. `\x1b[0m`, `\x1b[m`, or `\x1b[00m` and friends. These clear
+/// the active-style buffer in [`wrap_styled_cell`].
+fn is_full_reset(s: &str) -> bool {
+    if let Some(rest) = s.strip_prefix("\x1b[")
+        && let Some(body) = rest.strip_suffix('m')
+    {
+        return body.is_empty()
+            || body
+                .split(';')
+                .all(|p| p.trim_start_matches('0').is_empty());
+    }
+    false
+}
+
 fn stash_placeholder(value: String, placeholders: &mut Vec<String>) -> String {
     let key = format!("\u{0}MDSTREAM{}\u{0}", placeholders.len());
     placeholders.push(value);
@@ -547,6 +846,20 @@ pub struct StreamingMarkdownRenderer {
     list_level_meta: Vec<ListLevelMeta>,
     active_list_context: Option<ListContext>,
     show_list_guides: bool,
+    /// When `true`, [`render_table`] sizes each table to the live
+    /// terminal width (via [`detect_table_fit_width`]) instead of the
+    /// content-only widths used by default. Soft word-wrapping inside
+    /// cells keeps the grid aligned. When the live width can't be
+    /// determined (no TTY, no `COLUMNS`, terminal query failed,
+    /// reported width <= 0) the renderer silently falls back to the
+    /// content-only path so piped output still produces a clean table.
+    table_fit: bool,
+    /// Signed offset added to the detected terminal width when
+    /// computing the table's target width. Negative values shrink the
+    /// table (typical use: leave a right-side gutter); positive values
+    /// expand it past 100% (rarely useful, but symmetric). Has no
+    /// effect when `table_fit` is `false`.
+    table_width_offset: i32,
     term_width_override: Option<usize>,
     /// Number of fully-wrapped rows the current partial occupies ABOVE the
     /// cursor's current row. Total visual rows for the partial =
@@ -645,6 +958,8 @@ impl StreamingMarkdownRenderer {
             list_level_meta: Vec::new(),
             active_list_context: None,
             show_list_guides,
+            table_fit: false,
+            table_width_offset: 0,
             term_width_override: None,
             partial_rows: 0,
             partial_col: 0,
@@ -675,14 +990,41 @@ impl StreamingMarkdownRenderer {
                     .map(|_| false)
                     .unwrap_or(DEFAULT_SHOW_CODE_BACKGROUND)
             });
-        Self::with_code_theme_and_inline_code_color(
+        let mut renderer = Self::with_code_theme_and_inline_code_color(
             padding,
             show_lineno,
             show_list_guides,
             code_theme,
             show_code_background,
             inline_code_color,
-        )
+        );
+        if std::env::var("MDSTREAM_TABLE_FIT").is_ok() {
+            renderer.table_fit = true;
+        }
+        if let Some(offset) = std::env::var("MDSTREAM_TABLE_WIDTH_OFFSET")
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+        {
+            renderer.table_width_offset = offset;
+        }
+        renderer
+    }
+
+    /// Enable or disable terminal-width-aware table rendering. When
+    /// enabled, [`render_table`] expands every table to fill the live
+    /// terminal width (modulo `table_width_offset`) and soft-wraps cell
+    /// content so column dividers stay aligned. Auto-disables on a
+    /// per-table basis when no live width can be detected.
+    pub fn set_table_fit(&mut self, enabled: bool) {
+        self.table_fit = enabled;
+    }
+
+    /// Adjust the target table width by a signed cell count. `-N`
+    /// leaves an `N`-cell gutter on the right of the table; `+N`
+    /// over-expands the table past the detected width (useful only in
+    /// edge cases). Has no effect unless `table_fit` is enabled.
+    pub fn set_table_width_offset(&mut self, offset: i32) {
+        self.table_width_offset = offset;
     }
 
     pub fn render_line(&mut self, line: &str) -> String {
@@ -1197,7 +1539,7 @@ impl StreamingMarkdownRenderer {
             .skip(2)
             .filter_map(|line| split_table_row(line))
             .collect();
-        let mut widths = vec![0usize; header.len()];
+        let num_cols = header.len();
 
         let styled_header: Vec<String> = header
             .iter()
@@ -1217,14 +1559,28 @@ impl StreamingMarkdownRenderer {
             })
             .collect();
 
+        // Natural (max-content) widths per column — what the table
+        // wants if nothing constrained it.
+        let mut natural = vec![0usize; num_cols];
         for (idx, cell) in styled_header.iter().enumerate() {
-            widths[idx] = widths[idx].max(visible_width(cell));
+            natural[idx] = natural[idx].max(visible_width(cell));
         }
         for row in &styled_rows {
             for (idx, cell) in row.iter().enumerate() {
-                widths[idx] = widths[idx].max(visible_width(cell));
+                if idx < num_cols {
+                    natural[idx] = natural[idx].max(visible_width(cell));
+                }
             }
         }
+
+        // If table-fit is on AND we can measure the live terminal,
+        // re-allocate column widths against that target. Otherwise
+        // fall back to the natural widths (existing behavior).
+        let widths = if let Some(target_total) = self.detect_table_fit_width() {
+            self.fitted_column_widths(&styled_header, &styled_rows, &natural, target_total)
+        } else {
+            natural
+        };
 
         let mut lines = Vec::new();
         let header_alignments = vec![Alignment::Center; styled_header.len()];
@@ -1237,6 +1593,263 @@ impl StreamingMarkdownRenderer {
             }
         }
         lines.join("")
+    }
+
+    /// Render the live target width for the next table when
+    /// `table_fit` is enabled. Returns `None` (auto-disable for this
+    /// table) when:
+    ///
+    /// - `table_fit` is `false`
+    /// - no test override is set, no `COLUMNS` env var is parseable,
+    ///   stdout is not a TTY (so `terminal::size()` would be
+    ///   meaningless), or the terminal query failed
+    /// - the resulting width after applying `table_width_offset` and
+    ///   the renderer's left padding is `<= 0`
+    ///
+    /// The detection happens fresh each call so consecutive tables in
+    /// the same stream pick up terminal resizes between flushes.
+    fn detect_table_fit_width(&self) -> Option<usize> {
+        if !self.table_fit {
+            return None;
+        }
+        let cols = self.detect_live_columns()?;
+        let pad_w = visible_width(&self.pad) as i32;
+        let target = (cols as i32) + self.table_width_offset - pad_w;
+        if target <= 0 {
+            None
+        } else {
+            Some(target as usize)
+        }
+    }
+
+    /// Probe sources for the live terminal column count, in order:
+    /// the test override, the `COLUMNS` env var, and finally
+    /// `terminal::size()` *only* if stdout is a TTY. Returns `None`
+    /// when every source either failed or reported a non-positive
+    /// value.
+    fn detect_live_columns(&self) -> Option<usize> {
+        if let Some(width) = self.term_width_override {
+            return if width > 0 { Some(width) } else { None };
+        }
+        if let Some(width) = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+        {
+            return Some(width);
+        }
+        if !std::io::stdout().is_terminal() {
+            return None;
+        }
+        terminal::size()
+            .ok()
+            .map(|(c, _)| usize::from(c))
+            .filter(|n| *n > 0)
+    }
+
+    /// Allocate column widths that sum (with separators + cell
+    /// padding) to exactly `target_total` cells.
+    ///
+    /// The algorithm is a hybrid of CSS `table-layout: auto` and
+    /// pandoc's expanded-table layout:
+    ///
+    /// 1. Compute per-column `min` (longest single token, so words
+    ///    never need a hard mid-letter break unless the target is
+    ///    cruelly narrow) and `max` (the natural / max-content width
+    ///    already in `natural`).
+    /// 2. Subtract the fixed grid overhead (one cell of horizontal
+    ///    padding on each side of each column, plus one `│` between
+    ///    columns) from `target_total` to get `available` content
+    ///    cells.
+    /// 3. **Slack**: if `sum(max) <= available`, every column gets at
+    ///    least its `max` and the leftover is distributed
+    ///    proportionally to `max` so wider columns absorb more of the
+    ///    expansion (matches user expectation that the "big" column
+    ///    grows).
+    /// 4. **Fit**: if `sum(min) <= available < sum(max)`, start each
+    ///    column at `min` and distribute the remaining `available -
+    ///    sum(min)` proportionally to `(max - min)`. Columns with
+    ///    headroom receive headroom; columns whose content already
+    ///    fits stay tight.
+    /// 5. **Squeeze**: if `sum(min) > available`, distribute
+    ///    `available` proportionally to `min`. Cells will hard-wrap
+    ///    inside long words. Each column is clamped to `>= 1` so the
+    ///    grid never collapses to zero-width.
+    ///
+    /// In every branch the rounded sum is reconciled to exactly
+    /// `available` by adding/removing the rounding remainder one cell
+    /// at a time on the widest columns, so the table edges line up to
+    /// the column.
+    fn fitted_column_widths(
+        &self,
+        styled_header: &[String],
+        styled_rows: &[Vec<String>],
+        natural: &[usize],
+        target_total: usize,
+    ) -> Vec<usize> {
+        let n = natural.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Min widths: longest whitespace-delimited token per column.
+        // Use the styled cells (which carry ANSI) so visible widths
+        // are computed consistently with `natural`.
+        let mut min_widths = vec![1usize; n];
+        for (idx, cell) in styled_header.iter().enumerate() {
+            min_widths[idx] = min_widths[idx].max(longest_token_width(cell));
+        }
+        for row in styled_rows {
+            for (idx, cell) in row.iter().enumerate() {
+                if idx < n {
+                    min_widths[idx] = min_widths[idx].max(longest_token_width(cell));
+                }
+            }
+        }
+        // Clamp min to natural (a column whose content is empty has
+        // natural=0 and min could be 1 — keep min <= natural so we
+        // don't reserve more than the column ever needs).
+        for i in 0..n {
+            if natural[i] > 0 {
+                min_widths[i] = min_widths[i].min(natural[i]).max(1);
+            } else {
+                min_widths[i] = 0;
+            }
+        }
+
+        let overhead = 2 * n + (n - 1); // " X "..."│"..." X "
+        let available = target_total.saturating_sub(overhead);
+        if available == 0 {
+            return vec![1usize; n];
+        }
+
+        let sum_max: usize = natural.iter().sum();
+        let sum_min: usize = min_widths.iter().sum();
+
+        let mut widths: Vec<usize> = if sum_max <= available {
+            // Slack branch: distribute extra proportionally to max.
+            let extra = available - sum_max;
+            if sum_max == 0 {
+                // All columns empty — split available evenly.
+                vec![available / n; n]
+            } else {
+                let mut out = natural.to_vec();
+                let mut distributed = 0usize;
+                for i in 0..n {
+                    let share = (extra * natural[i]) / sum_max;
+                    out[i] += share;
+                    distributed += share;
+                }
+                // Hand any rounding remainder to the widest columns.
+                redistribute_remainder(
+                    &mut out,
+                    &natural_indices_by_width(natural),
+                    extra - distributed,
+                );
+                out
+            }
+        } else if sum_min <= available {
+            // Fit branch: each column gets `min`, share the
+            // remainder proportionally to (max - min).
+            let extra = available - sum_min;
+            let headroom: Vec<usize> = natural
+                .iter()
+                .zip(min_widths.iter())
+                .map(|(mx, mn)| mx.saturating_sub(*mn))
+                .collect();
+            let sum_head: usize = headroom.iter().sum();
+            let mut out = min_widths.clone();
+            if sum_head == 0 {
+                // No headroom (every column already at max == min) —
+                // sprinkle extra uniformly.
+                let base = extra / n;
+                for w in out.iter_mut() {
+                    *w += base;
+                }
+                redistribute_remainder(
+                    &mut out,
+                    &natural_indices_by_width(natural),
+                    extra - base * n,
+                );
+            } else {
+                let mut distributed = 0usize;
+                for i in 0..n {
+                    let share = (extra * headroom[i]) / sum_head;
+                    out[i] += share;
+                    distributed += share;
+                }
+                redistribute_remainder(
+                    &mut out,
+                    &headroom_indices_by_size(&headroom),
+                    extra - distributed,
+                );
+            }
+            out
+        } else {
+            // Squeeze branch: not enough room even for min widths.
+            // Distribute proportionally to min, clamp to >= 1.
+            if sum_min == 0 {
+                vec![available / n; n]
+            } else {
+                let mut out = vec![0usize; n];
+                let mut distributed = 0usize;
+                for i in 0..n {
+                    let share = ((available * min_widths[i]) / sum_min).max(1);
+                    out[i] = share;
+                    distributed += share;
+                }
+                // After the .max(1) clamps we may already exceed
+                // `available`. Reconcile by trimming widest columns.
+                while distributed > available {
+                    if let Some((idx, _)) = out
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &w)| w > 1)
+                        .max_by_key(|&(_, &w)| w)
+                    {
+                        out[idx] -= 1;
+                        distributed -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                if distributed < available {
+                    redistribute_remainder(
+                        &mut out,
+                        &natural_indices_by_width(&min_widths),
+                        available - distributed,
+                    );
+                }
+                out
+            }
+        };
+
+        // Final reconciliation guard: sum must be exactly `available`.
+        let sum: usize = widths.iter().sum();
+        if sum < available {
+            redistribute_remainder(
+                &mut widths,
+                &natural_indices_by_width(natural),
+                available - sum,
+            );
+        } else if sum > available {
+            let mut over = sum - available;
+            // Trim from the widest columns first, but never below 1.
+            while over > 0 {
+                if let Some((idx, _)) = widths
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &w)| w > 1)
+                    .max_by_key(|&(_, &w)| w)
+                {
+                    widths[idx] -= 1;
+                    over -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        widths
     }
 
     fn render_table_separator(
@@ -1260,18 +1873,45 @@ impl StreamingMarkdownRenderer {
         )
     }
 
+    /// Render one logical table row. When any cell's visible width
+    /// exceeds its allotted column width, that cell is soft-wrapped
+    /// (word-wrap with hard-break fallback for over-long tokens) and
+    /// the row spans as many visual lines as the tallest wrapped
+    /// cell, with the other cells padded with blanks below their
+    /// content. This keeps the column dividers vertically aligned
+    /// regardless of which columns wrapped.
     fn render_table_row(
         &self,
         cells: &[String],
         alignments: &[Alignment],
         widths: &[usize],
     ) -> String {
-        let padded: Vec<String> = cells
+        let wrapped: Vec<Vec<String>> = cells
             .iter()
             .enumerate()
-            .map(|(idx, cell)| format!(" {} ", align_cell(cell, widths[idx], alignments[idx])))
+            .map(|(idx, cell)| wrap_styled_cell(cell, widths[idx]))
             .collect();
-        format!("{}{}\n", self.pad, padded.join("│"))
+        let height = wrapped.iter().map(|w| w.len()).max().unwrap_or(1).max(1);
+
+        let mut out = String::new();
+        for line_idx in 0..height {
+            let padded: Vec<String> = wrapped
+                .iter()
+                .enumerate()
+                .map(|(col_idx, lines)| {
+                    let blank = String::new();
+                    let cell = lines.get(line_idx).unwrap_or(&blank);
+                    format!(
+                        " {} ",
+                        align_cell(cell, widths[col_idx], alignments[col_idx])
+                    )
+                })
+                .collect();
+            out.push_str(&self.pad);
+            out.push_str(&padded.join("│"));
+            out.push('\n');
+        }
+        out
     }
 
     fn erase_partial<W: Write>(&self, out: &mut W) -> Result<()> {

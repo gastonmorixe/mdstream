@@ -43,6 +43,8 @@ pub fn run(cli: cli::Cli) -> Result<()> {
         show_code_background,
         cli.inline_code_color,
     );
+    renderer.set_table_fit(cli.table_fit);
+    renderer.set_table_width_offset(cli.table_width_offset);
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
 

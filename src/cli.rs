@@ -66,4 +66,21 @@ pub struct Cli {
         help = "Disable themed backgrounds in fenced code blocks"
     )]
     pub no_code_background: bool,
+
+    #[arg(
+        long,
+        env = "MDSTREAM_TABLE_FIT",
+        default_value_t = false,
+        help = "Expand tables to the live terminal width with soft-wrapped cells (auto-disables when not a TTY)"
+    )]
+    pub table_fit: bool,
+
+    #[arg(
+        long,
+        env = "MDSTREAM_TABLE_WIDTH_OFFSET",
+        default_value_t = 0,
+        allow_negative_numbers = true,
+        help = "Cells to add (+) or subtract (-) from the table-fit target width; e.g. -10 leaves a 10-cell right gutter"
+    )]
+    pub table_width_offset: i32,
 }

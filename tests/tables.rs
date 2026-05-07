@@ -126,3 +126,412 @@ fn table_flushes_at_eof() {
     assert!(plain.contains(" A "));
     assert!(plain.contains(" one │ two "));
 }
+
+// ---------------------------------------------------------------------------
+// Terminal-width-aware ("table-fit") rendering. Opt-in via
+// `set_table_fit(true)` (mirrors the `--table-fit` / `MDSTREAM_TABLE_FIT`
+// flag). When on, every flushed table is allocated against the live
+// terminal width, with cells soft-wrapped to keep columns aligned.
+// ---------------------------------------------------------------------------
+
+/// Helper: feed a single table and return the rendered output as plain
+/// text (ANSI stripped, trailing newline trimmed for asserts).
+fn render_table_fit(rows: &[&str], cols: usize, offset: i32) -> String {
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+    renderer.set_term_width_override_for_tests(cols);
+    renderer.set_table_fit(true);
+    renderer.set_table_width_offset(offset);
+    let mut last = String::new();
+    for row in rows {
+        last = renderer.render_line(row);
+    }
+    let mut out = Vec::new();
+    renderer.finish(&mut out).unwrap();
+    let tail = String::from_utf8(out).unwrap();
+    strip_ansi(&format!("{last}{tail}"))
+}
+
+/// Visible width of `line` measured the same way mdstream measures it
+/// (after ANSI strip + unicode-width). Used by table-fit asserts to
+/// verify each rendered row exactly hits the target width.
+fn visible_width(line: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    line.width()
+}
+
+#[test]
+fn table_fit_disabled_keeps_content_width() {
+    // Without `set_table_fit(true)`, the table must still size to its
+    // content even on a wide terminal — preserves the pre-feature
+    // default and matches the existing `table_is_buffered_until_closed`
+    // contract.
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+    renderer.set_term_width_override_for_tests(200);
+
+    let _ = renderer.render_line("| A | B |\n");
+    let _ = renderer.render_line("|---|---|\n");
+    let _ = renderer.render_line("| one | two |\n");
+    let closed = strip_ansi(&renderer.render_line("after\n"));
+
+    let widths: Vec<usize> = closed
+        .split('\n')
+        .filter(|l| l.contains('│') || l.contains('┿') || l.contains('┼'))
+        .map(visible_width)
+        .collect();
+    assert!(!widths.is_empty(), "expected table rows: {closed:?}");
+    // Content-only widths are well below 200.
+    for w in &widths {
+        assert!(*w < 50, "row width {w} should be content-bounded, not 200");
+    }
+}
+
+#[test]
+fn table_fit_expands_table_to_terminal_width() {
+    // When the natural table is narrower than the terminal, fit-mode
+    // expands every row to fill the width exactly.
+    let rendered = render_table_fit(
+        &[
+            "| A | B |\n",
+            "|---|---|\n",
+            "| one | two |\n",
+            "| three | four |\n",
+        ],
+        60,
+        0,
+    );
+
+    let table_lines: Vec<&str> = rendered
+        .split('\n')
+        .filter(|l| l.contains('│') || l.contains('┿') || l.contains('┼'))
+        .collect();
+
+    assert!(!table_lines.is_empty(), "no table lines: {rendered:?}");
+    for line in &table_lines {
+        assert_eq!(
+            visible_width(line),
+            60,
+            "table line should fill 60 cols: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn table_fit_offset_subtracts_columns() {
+    // Negative offset leaves a right gutter; the table fills
+    // (term_width + offset) cells.
+    let rendered = render_table_fit(
+        &["| A | B | C |\n", "|---|---|---|\n", "| 1 | 2 | 3 |\n"],
+        80,
+        -10,
+    );
+    for line in rendered.split('\n').filter(|l| l.contains('│')) {
+        assert_eq!(visible_width(line), 70);
+    }
+}
+
+#[test]
+fn table_fit_offset_can_be_positive() {
+    // Positive offset over-expands beyond the detected width — symmetric
+    // with the negative path; we don't clamp because some hosts
+    // intentionally over-draw (e.g. embedded panels with their own
+    // gutter).
+    let rendered = render_table_fit(&["| A | B |\n", "|---|---|\n", "| x | y |\n"], 50, 5);
+    for line in rendered.split('\n').filter(|l| l.contains('│')) {
+        assert_eq!(visible_width(line), 55);
+    }
+}
+
+#[test]
+fn table_fit_soft_wraps_long_cell_content() {
+    // The natural width exceeds the target, so the wide column must
+    // soft-wrap — header row spans 1 visual line, body row spans
+    // multiple, and every visual line lines up at exactly `target`
+    // visible cells (so the column dividers stay vertically stacked).
+    let rendered = render_table_fit(
+        &[
+            "| Tag | Description |\n",
+            "|---|---|\n",
+            "| ok | one two three four five six seven eight nine ten eleven twelve |\n",
+        ],
+        40,
+        0,
+    );
+
+    let lines: Vec<&str> = rendered
+        .split('\n')
+        .filter(|l| l.contains('│') || l.contains('┿'))
+        .collect();
+    assert!(
+        lines.len() >= 3,
+        "expected wrapping to add visual rows: {rendered:?}"
+    );
+    for line in &lines {
+        assert_eq!(visible_width(line), 40, "row not 40 cells wide: {line:?}");
+    }
+
+    // No mid-word breaks: every word from the source must appear
+    // intact somewhere in the rendered text (post strip).
+    for word in [
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+        "twelve",
+    ] {
+        assert!(
+            rendered.contains(word),
+            "lost word `{word}` to a hard break: {rendered:?}"
+        );
+    }
+}
+
+#[test]
+fn table_fit_respects_alignment_per_wrapped_line() {
+    // A right-aligned column with a wrapped cell must right-align
+    // *each* wrapped visual line; left-aligned similarly. We verify by
+    // checking that left-aligned wrapped lines start with content (no
+    // leading pad beyond the row's single-cell padding) and
+    // right-aligned wrapped lines end with content.
+    let rendered = render_table_fit(
+        &[
+            "| Left | Right |\n",
+            "| :--- | ---: |\n",
+            "| aaaa bbbb cccc dddd | wwww xxxx yyyy zzzz |\n",
+        ],
+        30,
+        0,
+    );
+    let body: Vec<&str> = rendered
+        .split('\n')
+        .filter(|l| l.contains('│') && !l.contains('━'))
+        .collect();
+    // Header (1 line) + at least 2 wrapped body lines.
+    assert!(body.len() >= 3, "expected wrap rows: {rendered:?}");
+
+    // Inspect just the body wrap rows (skip header).
+    for line in body.iter().skip(1) {
+        let cells: Vec<&str> = line.split('│').collect();
+        assert_eq!(cells.len(), 2, "expected 2 cells: {line:?}");
+        let left = cells[0];
+        let right = cells[1];
+        // Left cell: " " (cell pad) then content, then trailing pad of
+        // spaces from the left-align padding. The leading pad is
+        // exactly one space (the cell's intrinsic left padding).
+        assert!(left.starts_with(' '), "left cell missing pad: {left:?}");
+        if !left.trim().is_empty() {
+            // Exactly one leading space — content begins on cell's
+            // left edge under left alignment.
+            assert_eq!(
+                left.chars().take_while(|c| *c == ' ').count(),
+                1,
+                "left-aligned cell has unexpected leading whitespace: {left:?}"
+            );
+        }
+        // Right cell: leading pad spaces (right alignment) + content +
+        // single trailing space (the cell's intrinsic right padding).
+        assert!(right.ends_with(' '), "right cell missing pad: {right:?}");
+        if !right.trim().is_empty() {
+            // Exactly one trailing space — right-aligned content hugs
+            // the right edge of the cell.
+            assert_eq!(
+                right.chars().rev().take_while(|c| *c == ' ').count(),
+                1,
+                "right-aligned cell has unexpected trailing whitespace: {right:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn table_fit_auto_disables_when_no_width_detectable() {
+    // No override, no COLUMNS env var, stdin/stdout aren't TTYs in the
+    // test process. Fit-mode must silently fall back to content widths
+    // instead of panicking or producing an 80-col fallback table.
+    // SAFETY: ensure COLUMNS isn't set by the harness; restored after.
+    let prev = std::env::var("COLUMNS").ok();
+    unsafe { std::env::remove_var("COLUMNS") };
+
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+    renderer.set_table_fit(true);
+    // Deliberately no `set_term_width_override_for_tests` and no
+    // COLUMNS — `detect_live_columns` should hit the
+    // `!is_terminal()` branch and return None.
+
+    let _ = renderer.render_line("| A | B |\n");
+    let _ = renderer.render_line("|---|---|\n");
+    let _ = renderer.render_line("| one | two |\n");
+    let closed = strip_ansi(&renderer.render_line("after\n"));
+
+    let widths: Vec<usize> = closed
+        .split('\n')
+        .filter(|l| l.contains('│'))
+        .map(visible_width)
+        .collect();
+    assert!(!widths.is_empty(), "table should still render: {closed:?}");
+    // Content-only widths — well under any terminal we'd see.
+    for w in widths {
+        assert!(w < 30, "expected content-bounded width, got {w}");
+    }
+
+    if let Some(v) = prev {
+        unsafe { std::env::set_var("COLUMNS", v) };
+    }
+}
+
+#[test]
+fn table_fit_target_zero_or_negative_falls_back() {
+    // If `terminal_width + offset - padding <= 0`, the renderer must
+    // not divide-by-zero or panic. It auto-disables for that table.
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+    renderer.set_term_width_override_for_tests(20);
+    renderer.set_table_fit(true);
+    // Offset that drives the target to zero.
+    renderer.set_table_width_offset(-20);
+
+    let _ = renderer.render_line("| A | B |\n");
+    let _ = renderer.render_line("|---|---|\n");
+    let _ = renderer.render_line("| one | two |\n");
+    let closed = strip_ansi(&renderer.render_line("after\n"));
+
+    // Should fall back to natural widths (small, not panic, not zero).
+    let widths: Vec<usize> = closed
+        .split('\n')
+        .filter(|l| l.contains('│'))
+        .map(visible_width)
+        .collect();
+    assert!(!widths.is_empty(), "table missing: {closed:?}");
+    for w in widths {
+        assert!((5..30).contains(&w), "width {w} outside fallback range");
+    }
+}
+
+#[test]
+fn table_fit_re_detects_width_each_render() {
+    // Spec: "no resizing, this is just a one off calculation at the
+    // time each table is rendered." Two consecutive tables with
+    // different `term_width_override` values must be sized
+    // independently — i.e. the second table picks up the new width.
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+    renderer.set_table_fit(true);
+
+    // First table at 60 cols.
+    renderer.set_term_width_override_for_tests(60);
+    let _ = renderer.render_line("| A | B |\n");
+    let _ = renderer.render_line("|---|---|\n");
+    let _ = renderer.render_line("| one | two |\n");
+    let first = strip_ansi(&renderer.render_line("\n"));
+
+    // Second table at 100 cols.
+    renderer.set_term_width_override_for_tests(100);
+    let _ = renderer.render_line("| C | D |\n");
+    let _ = renderer.render_line("|---|---|\n");
+    let _ = renderer.render_line("| three | four |\n");
+    let second = strip_ansi(&renderer.render_line("after\n"));
+
+    let first_w = first
+        .split('\n')
+        .filter(|l| l.contains('│'))
+        .map(visible_width)
+        .next()
+        .unwrap();
+    let second_w = second
+        .split('\n')
+        .filter(|l| l.contains('│'))
+        .map(visible_width)
+        .next()
+        .unwrap();
+    assert_eq!(first_w, 60);
+    assert_eq!(second_w, 100);
+}
+
+#[test]
+fn table_fit_propagates_styling_across_wrapped_lines() {
+    // A bold header that wraps must remain bold on its continuation
+    // line. Verify by checking the rendered output (with ANSI intact)
+    // contains a `\x1b[1m` marker on the second visual line of the
+    // wrapped header.
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+    renderer.set_term_width_override_for_tests(40);
+    renderer.set_table_fit(true);
+
+    let _ = renderer.render_line("| Population (millions) | X |\n");
+    let _ = renderer.render_line("|---|---|\n");
+    let _ = renderer.render_line("| 100 | y |\n");
+    let mut out = Vec::new();
+    renderer.finish(&mut out).unwrap();
+    let raw = String::from_utf8(out).unwrap();
+
+    // Find the position of the closing `(millions)` text — it's on a
+    // continuation line of the wrapped header. The bold open `\x1b[1m`
+    // must appear before it (re-emitted at line start).
+    let idx = raw
+        .find("(millions)")
+        .expect("expected wrapped header continuation");
+    let before = &raw[..idx];
+    let last_reset = before.rfind("\x1b[0m").unwrap_or(0);
+    let after_reset = &raw[last_reset..idx];
+    assert!(
+        after_reset.contains("\x1b[1m"),
+        "bold style not re-emitted on wrapped header line: {after_reset:?}"
+    );
+}
+
+#[test]
+fn table_fit_wraps_cjk_wide_glyphs_correctly() {
+    // CJK characters are 2 cells each. Wrapping must respect their
+    // width — the rendered row width must still equal the target.
+    let rendered = render_table_fit(
+        &[
+            "| Name | Note |\n",
+            "|---|---|\n",
+            "| 日本 | 日本語のテキスト 日本語のテキスト 日本語のテキスト |\n",
+        ],
+        40,
+        0,
+    );
+    for line in rendered.split('\n').filter(|l| l.contains('│')) {
+        assert_eq!(visible_width(line), 40, "cjk row not 40 cells: {line:?}");
+    }
+}
+
+#[test]
+fn table_fit_squeeze_branch_handles_too_narrow_target() {
+    // Target < sum of column min widths. We don't panic; every
+    // column gets at least 1 cell of content; row width still
+    // equals target.
+    let rendered = render_table_fit(
+        &[
+            "| Veryverylongheader | Anotherlongheader | Third |\n",
+            "|---|---|---|\n",
+            "| supercalifragilistic | a | b |\n",
+        ],
+        20,
+        0,
+    );
+    for line in rendered.split('\n').filter(|l| l.contains('│')) {
+        assert_eq!(visible_width(line), 20, "squeeze row off: {line:?}");
+    }
+}
+
+// --- column-allocation algorithm: white-box checks via the public render path ---
+
+#[test]
+fn table_fit_distributes_slack_proportional_to_max_widths() {
+    // Two columns: short and long. With ample slack the long column
+    // absorbs more of the expansion than the short one, mirroring CSS
+    // table-layout: auto behavior.
+    let rendered = render_table_fit(
+        &["| S | LongerColumn |\n", "|---|---|\n", "| 1 | text |\n"],
+        60,
+        0,
+    );
+    let body = rendered
+        .split('\n')
+        .find(|l| l.contains('│') && l.contains('1'))
+        .unwrap();
+    let cells: Vec<&str> = body.split('│').collect();
+    assert_eq!(cells.len(), 2);
+    let short_len = visible_width(cells[0]);
+    let long_len = visible_width(cells[1]);
+    assert!(
+        long_len > short_len * 2,
+        "long column should absorb more slack: short={short_len} long={long_len}"
+    );
+}

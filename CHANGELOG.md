@@ -4,6 +4,17 @@ All notable changes to `mdstream` are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-06
+
+### Added
+
+- Opt-in `--table-fit` flag (env: `MDSTREAM_TABLE_FIT`) for terminal-width-aware table layout. When enabled, every flushed table is sized against the live terminal width — measured fresh per table so consecutive tables can pick up resizes between flushes. Cells that exceed their allotted column width are soft-wrapped at word boundaries with a hard-break fallback for over-long tokens; ANSI styling carries across wrap boundaries so a bold or colored cell stays bold/colored on every visual row.
+- Companion `--table-width-offset N` flag (env: `MDSTREAM_TABLE_WIDTH_OFFSET`, signed) for trimming or expanding the table-fit target width by a cell count. Negative values leave a right gutter; positive values over-expand.
+
+### Changed
+
+- Column widths under `--table-fit` are allocated by a CSS `table-layout: auto`-style hybrid: a *slack* branch when content fits with room to spare (extra distributed proportional to natural widths), a *fit* branch when content fits only after squeezing (extra distributed proportional to per-column headroom), and a *squeeze* branch for too-narrow targets (proportional to min with `>= 1` clamps and trim-from-widest reconciliation). Width detection auto-disables — falls back to the existing content-only widths — when no live width can be determined (no TTY, no `COLUMNS`, terminal query failed) or the post-offset, post-padding target is non-positive.
+
 ## [0.2.2] - 2026-05-05
 
 ### Fixed
