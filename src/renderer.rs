@@ -511,8 +511,28 @@ fn wrap_styled_cell(text: &str, width: usize) -> Vec<String> {
                 continue;
             }
             let ch = text[i..].chars().next().unwrap();
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-            let glyph_end = i + ch.len_utf8();
+            let mut glyph_end = i + ch.len_utf8();
+            // Bundle a following Variation Selector (VS15 U+FE0E forces
+            // text presentation, VS16 U+FE0F forces emoji presentation)
+            // into the same glyph atom. The selector is zero-width on
+            // its own but can change the preceding char's presentation
+            // — and therefore its cell width — from 1 to 2 (or vice
+            // versa). Without this lookahead, the per-char width here
+            // disagrees with the string-level `visible_width` used by
+            // `align_cell`, and wrapping packs one extra cell onto a
+            // line. Bundling also keeps the base+VS pair from being
+            // split across a wrap boundary.
+            if glyph_end < end
+                && let Some(next) = text[glyph_end..].chars().next()
+                && (next == '\u{FE0E}' || next == '\u{FE0F}')
+            {
+                glyph_end += next.len_utf8();
+            }
+            // Use string-level width on the bundled slice so the VS's
+            // effect on the base codepoint is honored (this is what
+            // `UnicodeWidthStr::width` does, and what `visible_width`
+            // uses elsewhere).
+            let cw = UnicodeWidthStr::width(&text[i..glyph_end]);
             pieces.push(WordPiece {
                 prefix: std::mem::take(&mut pending_prefix),
                 glyph: &text[i..glyph_end],
@@ -2288,5 +2308,126 @@ mod erase_partial_tests {
         r.write_chunk("\n", &mut out).unwrap();
         assert_eq!(r.partial_rows_for_tests(), 0);
         assert_eq!(r.partial_col_for_tests(), 0);
+    }
+}
+
+#[cfg(test)]
+mod wrap_styled_cell_tests {
+    //! Regression coverage for the cell-wrap width bug that surfaced as
+    //! table rows mis-aligned by ±1 cell when a cell contained an emoji
+    //! whose presentation width depends on a Variation Selector (VS15
+    //! U+FE0E for text, VS16 U+FE0F for emoji presentation).
+    //!
+    //! `visible_width` uses `UnicodeWidthStr::width` which inspects the
+    //! whole string and applies VS-aware emoji-presentation rules. The
+    //! wrap function used to call `UnicodeWidthChar::width` per
+    //! codepoint, which can't see the following VS and therefore
+    //! disagrees with `visible_width` on the same input. When the
+    //! disagreement caused the wrap function to pack one extra glyph
+    //! onto a line, `align_cell`'s `saturating_sub` clamped the padding
+    //! to zero and the produced row overflowed the column by 1 cell,
+    //! pushing the closing `│` off the right edge of the terminal.
+    //!
+    //! The invariant these tests pin: every line returned by
+    //! `wrap_styled_cell(text, width)` must have `visible_width(line)
+    //! <= width`. If that holds, `align_cell` always pads correctly.
+    use super::*;
+
+    fn assert_lines_fit(text: &str, width: usize) {
+        let lines = wrap_styled_cell(text, width);
+        for (i, line) in lines.iter().enumerate() {
+            let w = visible_width(line);
+            assert!(
+                w <= width,
+                "line {i} (visible_width={w}) exceeds wrap target {width}: {line:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn vs16_emoji_with_text_wraps_within_column() {
+        // The user-reported failure: "⚠️ Degraded" wrapped at the
+        // narrow column it ends up in when an 18-col status table is
+        // squeezed by --table-fit. Pre-fix, the wrap function counted
+        // ⚠ as 1 cell, VS16 as 0, so a "fits-in-6" check let through
+        // a line that was actually 7 cells wide.
+        assert_lines_fit("⚠️ Degraded", 6);
+        assert_lines_fit("⚠️ Degraded", 5);
+        assert_lines_fit("⚠️ Degraded", 4);
+        assert_lines_fit("⚠️ Degraded", 3);
+    }
+
+    #[test]
+    fn vs16_club_suit_wraps_within_column() {
+        // The probe-table failure: ♣️ (U+2663 + VS16). VS16 forces
+        // emoji presentation → terminal renders 2 cells but
+        // UnicodeWidthChar::width('♣') = 1.
+        assert_lines_fit("♣️ Black Club", 6);
+        assert_lines_fit("♣️ Black Club", 4);
+    }
+
+    #[test]
+    fn check_mark_with_text_wraps_within_column() {
+        // U+2705 has default emoji presentation (no VS16 needed) —
+        // UnicodeWidthChar already returns 2 for it, so this case was
+        // already correct pre-fix. Pinning it as a non-regression.
+        assert_lines_fit("✅ Healthy", 6);
+        assert_lines_fit("✅ Healthy", 4);
+    }
+
+    #[test]
+    fn pause_button_vs16_wraps_within_column() {
+        // U+23F8 + VS16 = ⏸️
+        assert_lines_fit("⏸️ Paused", 5);
+        assert_lines_fit("⏸️ Paused", 4);
+    }
+
+    #[test]
+    fn ascii_only_baseline_still_wraps_correctly() {
+        assert_lines_fit("plain ascii cell content", 10);
+        assert_lines_fit("plain ascii cell content", 5);
+        assert_lines_fit("plain ascii cell content", 3);
+    }
+
+    #[test]
+    fn cjk_wraps_within_column() {
+        // Non-emoji wide characters (CJK). UnicodeWidthChar already
+        // returns 2 for these — guard against accidental regressions.
+        assert_lines_fit("日本語 text", 6);
+        assert_lines_fit("日本語 text", 4);
+    }
+
+    #[test]
+    fn vs16_alone_in_cell_wraps_within_column() {
+        // Just the emoji + VS16, no trailing text.
+        assert_lines_fit("⚠️", 3);
+        assert_lines_fit("⚠️", 2);
+        assert_lines_fit("♣️", 3);
+        assert_lines_fit("♣️", 2);
+    }
+
+    #[test]
+    fn vs16_at_word_boundary_keeps_glyph_intact() {
+        // The wrap atomizes glyphs; VS16 must travel with its base
+        // codepoint, never broken off onto the next line. We can't
+        // easily check "VS16 stayed with ⚠" by inspecting the line
+        // string (visible_width strips it as zero-width), so we check
+        // the byte sequence directly.
+        let lines = wrap_styled_cell("⚠️ Degraded", 4);
+        // The first line must contain the full ⚠️ sequence (U+26A0
+        // followed by U+FE0F), not ⚠ alone with VS16 orphaned onto
+        // the next line.
+        let warn_with_vs = "\u{26A0}\u{FE0F}";
+        assert!(
+            lines.iter().any(|l| l.contains(warn_with_vs)),
+            "expected at least one line to contain the full ⚠️ sequence; got {lines:?}"
+        );
+        // No line should start with a bare VS16.
+        for line in &lines {
+            assert!(
+                !line.starts_with('\u{FE0F}'),
+                "VS16 was orphaned onto a continuation line: {lines:?}"
+            );
+        }
     }
 }

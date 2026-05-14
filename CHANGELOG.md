@@ -4,8 +4,11 @@ All notable changes to `mdstream` are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-05-14
+
 ### Fixed
 
+- Table cells containing a base codepoint followed by a Variation Selector (VS15 `U+FE0E` text presentation, VS16 `U+FE0F` emoji presentation) no longer mis-align the surrounding row by ±1 cell when `--table-fit` soft-wraps the cell. `wrap_styled_cell` measured glyph width per codepoint via `UnicodeWidthChar::width`, which can't see the following VS and therefore disagreed with the string-level `UnicodeWidthStr::width` used by `visible_width` / `align_cell`. Wrapping packed one extra cell onto the line, `align_cell`'s `saturating_sub` clamped padding to zero, and the row overflowed the column by 1 cell — pushing the closing `│` off the right edge of the terminal (visible as "the last column lost its border"). Fix: in `read_word_pieces`, bundle each base codepoint and any immediately-following `U+FE0E` / `U+FE0F` into a single glyph atom whose width is computed via `UnicodeWidthStr::width` on the combined slice. Bonus: the base+VS pair can no longer be split across a wrap boundary. Reproduces with `⚠️ Degraded`, `♣️ Black Club Suit`, `⏸️ Paused` at narrow column widths; regression tests in `wrap_styled_cell_tests`.
 - Tables with ragged rows (a row whose cell count differs from the header) no longer break the rest of the table. Previously, the first mismatched row flushed the table early and every subsequent row — *including rows that DID match the header* — rendered as raw `| cell | cell |` markdown text, because re-entering table mode requires a fresh `|---|` separator that the input doesn't have. New GFM-compatible behavior: ragged rows stay inside the table; missing trailing cells render blank, extra cells are dropped. Reported via `tmp/make-a-detailed-plan-virtual-dusk.md` where row 13 of a 4-column table omitted its `| Source |` cell and torpedoed rows 13 onward. Regression test: `ragged_rows_keep_table_open` in `tests/tables.rs`.
 
 ## [0.3.2] - 2026-05-06
