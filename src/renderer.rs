@@ -25,6 +25,13 @@ const BRIGHT_MAGENTA: &str = "\x1b[95m";
 
 const LIST_BULLETS: &[&str] = &["•", "◦", "▪", "‣"];
 
+/// Single-cell marker drawn at the left of the live partial row when
+/// the buffer has outgrown the visible budget. Reserves exactly one
+/// column so the rest of the budget is paid out to a tail-window of
+/// the partial. U+2026 HORIZONTAL ELLIPSIS is one cell in every common
+/// terminal font and universally read as "there is more here".
+const TAIL_WINDOW_MARKER: char = '…';
+
 const LANG_COLOR_DEFAULT: &str = DIM;
 
 const LANG_COLORS: &[(&str, &str)] = &[
@@ -361,6 +368,67 @@ fn block_prefix(base_pad: &str, quote_depth: usize) -> String {
 fn visible_width(text: &str) -> usize {
     let plain = ansi_re().replace_all(text, "");
     UnicodeWidthStr::width(plain.as_ref())
+}
+
+/// Return a suffix of `text` whose visible width is `<= budget`, never
+/// cutting inside a grapheme cluster (base + variation selector + any
+/// following combining marks). When a cluster straddles the budget edge
+/// the cluster is dropped too, so the returned suffix is at most one
+/// cluster shorter than `budget`, guaranteeing the caller can paint it
+/// on a single row without overflow and without an orphaned combining
+/// mark at the left edge.
+///
+/// `text` is assumed to be raw input (no ANSI escapes); the streaming
+/// partial buffer satisfies that invariant. If you ever feed pre-styled
+/// text in here, you'll need to step over CSI sequences first.
+fn tail_by_width(text: &str, budget: usize) -> &str {
+    if budget == 0 || text.is_empty() {
+        return "";
+    }
+    let total = visible_width(text);
+    if total <= budget {
+        return text;
+    }
+    // Drop grapheme clusters from the left until enough cells are gone.
+    // A cluster = one base codepoint + a run of width-0 codepoints
+    // (combining marks, VS-15/VS-16, ZWJ). VS can mutate the base's
+    // display width (e.g. ⚠ + VS16 = 2 cells), so we measure the cluster
+    // slice with `UnicodeWidthStr::width`, same model as
+    // `wrap_styled_cell`'s glyph atomizer.
+    let target_drop = total - budget;
+    let mut dropped = 0usize;
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        let base_len = match text[cursor..].chars().next() {
+            Some(c) => c.len_utf8(),
+            None => break,
+        };
+        let mut cluster_end = cursor + base_len;
+        while cluster_end < text.len() {
+            let next = match text[cluster_end..].chars().next() {
+                Some(c) => c,
+                None => break,
+            };
+            if UnicodeWidthChar::width(next).unwrap_or(0) == 0 {
+                cluster_end += next.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let cw = UnicodeWidthStr::width(&text[cursor..cluster_end]);
+        if dropped + cw > target_drop {
+            // Cluster straddles the boundary: drop it whole rather than
+            // return a suffix wider than `budget`.
+            cursor = cluster_end;
+            break;
+        }
+        dropped += cw;
+        cursor = cluster_end;
+        if dropped >= target_drop {
+            break;
+        }
+    }
+    &text[cursor..]
 }
 
 fn indent_columns(indent: &str) -> usize {
@@ -918,6 +986,15 @@ pub struct StreamingMarkdownRenderer {
     /// at erase time than it did at emit time, but we already accounted
     /// for the wraps that actually happened on the user's terminal.
     partial_col: usize,
+    /// `true` once the current partial has been drawn as a tail-window
+    /// (dim leading `…` + rightmost `budget - 1` cells) because the
+    /// full buffer no longer fit on a single row. While set, every
+    /// subsequent byte of this partial triggers a full erase + repaint
+    /// so the window slides left in lock-step with the producer. Reset
+    /// to `false` on each newline flush and on `finish`, i.e. once the
+    /// partial is committed, the next partial starts fresh in the
+    /// zero-overhead append-only path.
+    partial_overflowed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1006,6 +1083,7 @@ impl StreamingMarkdownRenderer {
             term_width_override: None,
             partial_rows: 0,
             partial_col: 0,
+            partial_overflowed: false,
         }
     }
 
@@ -1088,14 +1166,21 @@ impl StreamingMarkdownRenderer {
     pub fn write_chunk<W: Write>(&mut self, chunk: &str, out: &mut W) -> Result<()> {
         let parts: Vec<&str> = chunk.split('\n').collect();
         if parts.len() == 1 {
-            if self.partial.is_empty() {
-                write!(out, "{}", self.pad)?;
-                self.advance_partial_position(&self.pad.clone());
+            let new_bytes = parts[0];
+            let already_drawn = !self.partial.is_empty();
+            let budget = self.live_budget();
+            let prospective = visible_width(&self.partial) + visible_width(new_bytes);
+            // Fast path: while the partial still fits the live row, just
+            // append new bytes, same byte sequence as pre-tail-window
+            // behavior, no flicker. Slow path: switch to the dim-`…` +
+            // tail-window once we'd otherwise wrap, and stay there until
+            // the next newline flush resets us.
+            if !self.partial_overflowed && prospective <= budget {
+                self.partial.push_str(new_bytes);
+                return self.append_partial_bytes(new_bytes, already_drawn, out);
             }
-            self.partial.push_str(parts[0]);
-            write!(out, "{}", parts[0])?;
-            self.advance_partial_position(parts[0]);
-            return Ok(());
+            self.partial.push_str(new_bytes);
+            return self.redraw_partial_overflow(out);
         }
 
         let first_complete = format!("{}{}", self.partial, parts[0]);
@@ -1103,6 +1188,7 @@ impl StreamingMarkdownRenderer {
         self.partial.clear();
         self.partial_rows = 0;
         self.partial_col = 0;
+        self.partial_overflowed = false;
         write!(out, "{}", self.render_line(&(first_complete + "\n")))?;
 
         for part in &parts[1..parts.len() - 1] {
@@ -1111,11 +1197,18 @@ impl StreamingMarkdownRenderer {
 
         self.partial = parts[parts.len() - 1].to_owned();
         if !self.partial.is_empty() {
-            write!(out, "{}", self.pad)?;
-            self.advance_partial_position(&self.pad.clone());
-            let new_partial = self.partial.clone();
-            write!(out, "{}", new_partial)?;
-            self.advance_partial_position(&new_partial);
+            // Route the new partial through the same fast/slow decision
+            // used for incoming chunks. If the leftover tail of a multi-
+            // line chunk is already too wide, render it as a tail-window
+            // straight away instead of wrapping it and then having to
+            // fix up on the next token.
+            let budget = self.live_budget();
+            if visible_width(&self.partial) <= budget {
+                let bytes = self.partial.clone();
+                self.append_partial_bytes(&bytes, false, out)?;
+            } else {
+                self.redraw_partial_overflow(out)?;
+            }
         }
         Ok(())
     }
@@ -1126,6 +1219,7 @@ impl StreamingMarkdownRenderer {
             let partial = std::mem::take(&mut self.partial);
             self.partial_rows = 0;
             self.partial_col = 0;
+            self.partial_overflowed = false;
             write!(out, "{}", self.render_line(&(partial + "\n")))?;
         }
         let buffered = self.flush_buffered_table();
@@ -2036,6 +2130,116 @@ impl StreamingMarkdownRenderer {
         }
     }
 
+    /// Cells available for the partial *after* the left pad, computed
+    /// against the *current* `term_width()`. A new probe every call
+    /// makes the live row resize-aware between tokens.
+    fn live_budget(&self) -> usize {
+        self.term_width().saturating_sub(visible_width(&self.pad))
+    }
+
+    /// Slow-path redraw of the live row. Erases the current row, emits
+    /// pad, then either:
+    ///
+    /// - **Refit branch** (`visible_width(partial) <= budget`): the
+    ///   full buffer fits again (post-resize or after a newline cut a
+    ///   chunk down). Render the buffer verbatim and clear
+    ///   `partial_overflowed` so the next token can take the
+    ///   zero-overhead append-only path.
+    /// - **Tail-window branch** (`visible_width(partial) > budget`):
+    ///   render `pad` + dim `…` + rightmost `budget - 1` cells of the
+    ///   buffer. Latch `partial_overflowed = true` so every subsequent
+    ///   token on this partial takes the slow path and the window
+    ///   slides left in lock-step with the producer.
+    ///
+    /// Edge cases:
+    /// - `budget == 0` (pad >= term width): emit `\r\x1b[K` + pad only,
+    ///   no marker, no content. The buffer is preserved for the eventual
+    ///   newline flush. `partial_overflowed` stays cleared so a future
+    ///   widen-resize repaints naturally.
+    /// - `budget == 1`: only the dim marker is drawn, no tail content.
+    /// - `budget >= 2`: dim marker + tail of up to `budget - 1` cells.
+    ///   `tail_by_width` may return fewer cells if a grapheme cluster
+    ///   straddles the boundary. The row never overruns.
+    fn redraw_partial_overflow<W: Write>(&mut self, out: &mut W) -> Result<()> {
+        // The first time we step in here for a given partial,
+        // `partial_rows` may legitimately be 0 (we caught the would-be
+        // overflow before drawing the offending byte). Subsequent calls
+        // also see 0 because we never let the partial wrap. The single
+        // exception is a narrowing resize between tokens, which we
+        // accept as a known limitation, the row count we tracked at
+        // emit time was correct, but the terminal may have reflowed the
+        // existing content. The next newline flush corrects everything
+        // by re-rendering the paragraph from scratch.
+        if self.partial_rows == 0 {
+            write!(out, "\r\x1b[K")?;
+        } else {
+            write!(out, "\x1b[{}A\r\x1b[J", self.partial_rows)?;
+        }
+        self.partial_rows = 0;
+        self.partial_col = 0;
+
+        write!(out, "{}", self.pad)?;
+        let pad = self.pad.clone();
+        self.advance_partial_position(&pad);
+
+        let budget = self.live_budget();
+        if budget == 0 {
+            // No room past the pad, surface nothing, just keep the
+            // cursor positioned. Don't latch overflow. A future widen
+            // should be able to reflow naturally on the next token.
+            self.partial_overflowed = false;
+            return Ok(());
+        }
+
+        // Refit branch: buffer fits the row again (post-resize wider,
+        // for example). Render verbatim and drop the overflow latch.
+        if visible_width(&self.partial) <= budget {
+            let buf = self.partial.clone();
+            write!(out, "{buf}")?;
+            self.advance_partial_position(&buf);
+            self.partial_overflowed = false;
+            return Ok(());
+        }
+
+        // Tail-window branch: emit the dim marker. `DIM`/`RESET` are
+        // zero visible width. Only the U+2026 contributes to the cursor.
+        write!(out, "{DIM}{TAIL_WINDOW_MARKER}{RESET}")?;
+        self.advance_partial_position(&TAIL_WINDOW_MARKER.to_string());
+
+        if budget >= 2 {
+            let tail = tail_by_width(&self.partial, budget - 1);
+            write!(out, "{tail}")?;
+            // Clone-free: `tail` borrows from `self.partial`. Walk a
+            // copy here because `advance_partial_position` takes
+            // `&mut self`.
+            let tail_owned = tail.to_owned();
+            self.advance_partial_position(&tail_owned);
+        }
+
+        self.partial_overflowed = true;
+        Ok(())
+    }
+
+    /// Append-only fast path: emit `text` (the new bytes just appended
+    /// to `self.partial`) directly to the terminal, plus the pad if
+    /// this is the first byte of a new partial. Mirrors the pre-tail-
+    /// window behavior exactly when the buffer fits the live budget.
+    fn append_partial_bytes<W: Write>(
+        &mut self,
+        text: &str,
+        already_drawn: bool,
+        out: &mut W,
+    ) -> Result<()> {
+        if !already_drawn {
+            write!(out, "{}", self.pad)?;
+            let pad = self.pad.clone();
+            self.advance_partial_position(&pad);
+        }
+        write!(out, "{text}")?;
+        self.advance_partial_position(text);
+        Ok(())
+    }
+
     fn term_width(&self) -> usize {
         if let Some(width) = self.term_width_override {
             return width.max(1);
@@ -2066,6 +2270,11 @@ impl StreamingMarkdownRenderer {
     #[doc(hidden)]
     pub fn partial_rows_for_tests(&self) -> usize {
         self.partial_rows
+    }
+
+    #[doc(hidden)]
+    pub fn partial_overflowed_for_tests(&self) -> bool {
+        self.partial_overflowed
     }
 
     #[doc(hidden)]
@@ -2130,17 +2339,17 @@ mod erase_partial_tests {
     //! visible "duplicate paragraph" in scrollback (one wrap row of raw
     //! markdown left behind above the rendered version).
     //!
-    //! The pre-fix `erase_partial` queried `terminal::size()` at flush
-    //! time and divided the partial's display length by that value. When
-    //! the terminal width seen at flush time was wider than the width
-    //! that was live when the partial bytes were originally emitted (a
-    //! resize, or `/dev/tty` returning a different value than the host's
-    //! `process.stdout.columns`), the row count under-estimated and the
-    //! cursor-up sequence didn't reach the start of the wrapped region —
-    //! `\r\x1b[K` then only cleared the bottom row.
-    //!
-    //! The fix is to track the partial's row count incrementally as
-    //! bytes are written, using the width that was live at each emit.
+    //! Pre-0.3.4 the partial could grow beyond the terminal width and
+    //! the renderer relied on width-at-emit tracking plus a multi-row
+    //! `\x1b[<n>A\r\x1b[J` rewind to undo every wrap before re-rendering
+    //! the line styled. That worked, but any drift between emit-time and
+    //! flush-time width could under-step the rewind and strand raw rows
+    //! in scrollback. 0.3.4 removes the failure mode at its root: the
+    //! live partial is *projected* through a tail-window so it is always
+    //! exactly one row tall, regardless of how long the buffer grows.
+    //! `partial_rows` therefore stays at 0 for any in-flight partial,
+    //! the rewind is always `\r\x1b[K`, and there is no width-at-emit vs
+    //! width-at-flush race to lose.
 
     use super::*;
 
@@ -2183,50 +2392,66 @@ mod erase_partial_tests {
     }
 
     #[test]
-    fn partial_row_count_matches_width_when_paragraph_wraps() {
-        // 135-cell wide pane, 170 char ASCII partial → wraps to 2 rows.
+    fn partial_collapses_to_single_row_when_buffer_overflows_width() {
+        // 135-cell wide pane, 170 char ASCII buffer. Pre-0.3.4 this
+        // wrapped onto 2 physical rows. The tail-window invariant is
+        // that the live row is always exactly 1 row, regardless of how
+        // long the buffer grows.
         let mut r = StreamingMarkdownRenderer::new(2, false, true);
         r.set_term_width_override_for_tests(135);
 
         let mut out = Vec::<u8>::new();
-        // Stream the partial in two chunks (no \n yet).
+        // Stream the partial in two chunks (no \n yet). Together they
+        // overflow the budget, second chunk trips the tail-window.
         let part_a: String = "a".repeat(100);
         let part_b: String = "b".repeat(70);
         r.write_chunk(&part_a, &mut out).unwrap();
         r.write_chunk(&part_b, &mut out).unwrap();
 
-        // pad (2) + 100 a + 70 b = 172 cells. At width 135: ceil(172/135) = 2 rows.
         assert_eq!(
             r.partial_rows_for_tests(),
-            1,
-            "should be 1 row above bottom"
+            0,
+            "tail-window keeps the partial on a single row"
         );
-        assert!(r.partial_col_for_tests() < 135);
+        assert!(
+            r.partial_overflowed_for_tests(),
+            "buffer outgrew the row → overflow mode latched"
+        );
+        // Buffer is preserved in full so the newline flush can render
+        // the styled paragraph correctly.
+        assert_eq!(r.partial.len(), 170);
+        assert!(r.partial_col_for_tests() <= 135);
     }
 
     #[test]
-    fn partial_redraw_steps_up_one_row_for_two_row_partial() {
+    fn newline_flush_after_overflow_uses_single_row_erase() {
         let mut r = StreamingMarkdownRenderer::new(2, false, true);
         r.set_term_width_override_for_tests(135);
 
         let mut out = Vec::<u8>::new();
-        // Build a 170-char partial that wraps to 2 rows on a 135-col term.
+        // Buffer is 170 chars, pre-0.3.4 wrapped to 2 rows. Tail-window
+        // keeps it on 1 row. The newline flush therefore only needs a
+        // single-row erase.
         r.write_chunk(&"x".repeat(170), &mut out).unwrap();
+        assert!(r.partial_overflowed_for_tests());
         out.clear();
 
-        // Now feed a `\n` — triggers erase_partial.
         r.write_chunk("\n", &mut out).unwrap();
         let seq = extract_erase_seq(&out).expect("erase sequence emitted");
-        assert_eq!(seq, "\x1b[1A\r\x1b[J", "must step up to start of wrap");
+        assert_eq!(
+            seq, "\r\x1b[K",
+            "tail-window always leaves the partial on the current row"
+        );
     }
 
     #[test]
     fn resize_after_emit_does_not_break_redraw() {
-        // Emit at width 135 (wraps to 2 rows), then "resize" wider before
-        // the \n arrives. Pre-fix: erase_partial would query the current
-        // (wider) width, see display_len < width, emit just `\r\x1b[K`,
-        // and leave the top wrap row stranded. Post-fix: row count was
-        // captured at emit time, so the up-step is preserved.
+        // Emit at width 135, the buffer overflows the row and the
+        // tail-window kicks in, so the partial is 1 row tall. Then
+        // "resize" wider before the \n arrives. Pre-0.3.4 this test
+        // pinned the width-at-emit row count to be preserved across a
+        // resize. The tail-window makes the invariant stronger: the
+        // erase is single-row regardless of resize direction.
         let mut r = StreamingMarkdownRenderer::new(2, false, true);
         r.set_term_width_override_for_tests(135);
 
@@ -2240,8 +2465,8 @@ mod erase_partial_tests {
         r.write_chunk("\n", &mut out).unwrap();
         let seq = extract_erase_seq(&out).expect("erase sequence emitted");
         assert_eq!(
-            seq, "\x1b[1A\r\x1b[J",
-            "row count must reflect width-at-emit, not width-at-flush"
+            seq, "\r\x1b[K",
+            "tail-window partial is always one row. Resize does not change that"
         );
     }
 
@@ -2260,19 +2485,24 @@ mod erase_partial_tests {
     }
 
     #[test]
-    fn three_row_partial_steps_up_two() {
+    fn very_wide_partial_still_renders_in_single_row() {
         let mut r = StreamingMarkdownRenderer::new(2, false, true);
         r.set_term_width_override_for_tests(50);
 
         let mut out = Vec::<u8>::new();
-        // pad(2) + 130 chars = 132 cells. At width 50: ceil(132/50) = 3 rows.
+        // pad(2) + 130 cells of content. Pre-0.3.4 this wrapped onto
+        // 3 physical rows. The tail-window stays on 1.
         r.write_chunk(&"x".repeat(130), &mut out).unwrap();
-        assert_eq!(r.partial_rows_for_tests(), 2);
+        assert_eq!(r.partial_rows_for_tests(), 0);
+        assert!(r.partial_overflowed_for_tests());
         out.clear();
 
         r.write_chunk("\n", &mut out).unwrap();
         let seq = extract_erase_seq(&out).expect("erase sequence emitted");
-        assert_eq!(seq, "\x1b[2A\r\x1b[J");
+        assert_eq!(
+            seq, "\r\x1b[K",
+            "single-row erase irrespective of buffer size"
+        );
     }
 
     #[test]
@@ -2296,18 +2526,325 @@ mod erase_partial_tests {
     }
 
     #[test]
-    fn paragraph_break_resets_partial_position() {
+    fn paragraph_break_resets_partial_position_and_overflow_flag() {
         let mut r = StreamingMarkdownRenderer::new(2, false, true);
         r.set_term_width_override_for_tests(50);
 
         let mut out = Vec::<u8>::new();
         r.write_chunk(&"x".repeat(130), &mut out).unwrap();
-        assert_eq!(r.partial_rows_for_tests(), 2);
+        // Tail-window holds the row at 1 even with a 130-char buffer.
+        assert_eq!(r.partial_rows_for_tests(), 0);
+        assert!(r.partial_overflowed_for_tests());
 
-        // \n flushes the partial. New partial is empty → counters reset.
+        // \n flushes the partial. New partial is empty → all counters
+        // reset and the next partial starts back in the zero-overhead
+        // append-only path.
         r.write_chunk("\n", &mut out).unwrap();
         assert_eq!(r.partial_rows_for_tests(), 0);
         assert_eq!(r.partial_col_for_tests(), 0);
+        assert!(!r.partial_overflowed_for_tests());
+    }
+}
+
+#[cfg(test)]
+mod tail_by_width_tests {
+    //! Unit coverage for the suffix-by-visual-width helper used by the
+    //! tail-window projection. The invariants pinned here:
+    //!
+    //! 1. `visible_width(result) <= budget`, always. No row overflow.
+    //! 2. No grapheme cluster is cut across the boundary, combining
+    //!    marks and VS-15/VS-16 travel with their base codepoint, never
+    //!    orphaned at the start of the returned suffix.
+    //! 3. When the entire input already fits, the input is returned
+    //!    unchanged (caller can fast-path the "no truncation" case).
+    //! 4. `budget == 0` and empty inputs are degenerate but safe, they
+    //!    yield an empty slice without panicking.
+
+    use super::*;
+
+    #[test]
+    fn budget_zero_returns_empty() {
+        assert_eq!(tail_by_width("anything", 0), "");
+        assert_eq!(tail_by_width("", 0), "");
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        assert_eq!(tail_by_width("", 10), "");
+    }
+
+    #[test]
+    fn budget_at_least_total_returns_input() {
+        assert_eq!(tail_by_width("hello", 5), "hello");
+        assert_eq!(tail_by_width("hello", 100), "hello");
+    }
+
+    #[test]
+    fn ascii_tail_is_rightmost_budget_cells() {
+        // "abcdefghij" is 10 cells. Budget 4 → keep the last 4.
+        assert_eq!(tail_by_width("abcdefghij", 4), "ghij");
+        assert_eq!(tail_by_width("abcdefghij", 1), "j");
+    }
+
+    #[test]
+    fn cjk_clusters_never_split() {
+        // "日本語abc" = 2+2+2+1+1+1 = 9 cells.
+        let s = "日本語abc";
+        // Budget 3 → "abc" (1+1+1 = 3 cells exactly).
+        assert_eq!(tail_by_width(s, 3), "abc");
+        // Budget 4, adding 語 (2 cells) would push us to 5 (over). So
+        // drop the cluster entirely and return "abc" (3 cells, <= 4).
+        assert_eq!(tail_by_width(s, 4), "abc");
+        // Budget 5 → "語abc" (2+1+1+1 = 5 cells exactly).
+        assert_eq!(tail_by_width(s, 5), "語abc");
+        // Budget 7 → "本語abc" (2+2+1+1+1 = 7).
+        assert_eq!(tail_by_width(s, 7), "本語abc");
+    }
+
+    #[test]
+    fn vs16_emoji_travels_with_base_at_boundary() {
+        // "x⚠️y", x(1) + ⚠️(2) + y(1) = 4 cells. ⚠️ is base+VS16.
+        let s = "x\u{26A0}\u{FE0F}y";
+        assert_eq!(visible_width(s), 4);
+        // Budget 1 → just "y".
+        assert_eq!(tail_by_width(s, 1), "y");
+        // Budget 2 → keeping ⚠️ alone needs 2 cells but would orphan y.
+        // We walk LTR from the start of the input dropping clusters;
+        // budget 2 means we need to drop 2 cells. After dropping "x"
+        // (1 cell) we're at 1 dropped. Next cluster is ⚠️ at 2 cells,
+        // dropping it pushes us to 3 > target_drop=2 → drop it whole.
+        // Result: "y" (1 cell, <= 2).
+        assert_eq!(tail_by_width(s, 2), "y");
+        // Budget 3 → drop only "x". Result: "⚠️y" with full VS16.
+        assert_eq!(tail_by_width(s, 3), "\u{26A0}\u{FE0F}y");
+    }
+
+    #[test]
+    fn combining_marks_never_orphaned_at_left_edge() {
+        // "Áb" = "A" + combining acute (U+0301) + "b". 2 cells visible.
+        let s = "A\u{0301}b";
+        assert_eq!(visible_width(s), 2);
+        // Budget 1: drop the whole "Á" cluster, keep "b".
+        let tail = tail_by_width(s, 1);
+        assert_eq!(tail, "b");
+        // Combining mark must never be the first byte of the suffix.
+        assert!(!tail.starts_with('\u{0301}'));
+    }
+
+    #[test]
+    fn result_visible_width_never_exceeds_budget() {
+        // Property-style sweep: random-ish lengths, every budget should
+        // honor the upper bound.
+        let inputs = [
+            "plain ascii content for the suffix",
+            "日本語混在 mixed ascii 文字列",
+            "x\u{26A0}\u{FE0F}y\u{2705}z\u{23F8}\u{FE0F}w", // VS16 + emoji mix
+            "A\u{0301}B\u{0302}C\u{0303}D",                 // combining marks
+        ];
+        for s in inputs {
+            for budget in 0..=visible_width(s) + 2 {
+                let tail = tail_by_width(s, budget);
+                let w = visible_width(tail);
+                assert!(
+                    w <= budget,
+                    "tail_by_width({s:?}, {budget}) = {tail:?} (width {w}) exceeds budget",
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tail_window_tests {
+    //! Integration coverage for the tail-window projection of the live
+    //! partial row. The visible behavior we promise to streaming hosts:
+    //!
+    //! - While the partial fits, output bytes are byte-identical to the
+    //!   pre-tail-window fast path (no flicker, no extra escapes).
+    //! - The instant the partial would overflow the row, the renderer
+    //!   switches to `\r\x1b[K` + pad + dim `…` + tail-window and stays
+    //!   in that mode until the next newline flush.
+    //! - Resize, CJK, VS-16, and combining marks all behave: the row is
+    //!   always exactly one row tall and never overflows the budget.
+    use super::*;
+
+    fn strip_ansi(text: &str) -> String {
+        let plain = ansi_re().replace_all(text, "");
+        plain.replace('\r', "")
+    }
+
+    const DIM_MARK: &str = "\x1b[2m…\x1b[0m";
+
+    #[test]
+    fn short_partial_takes_fast_path_no_dim_marker() {
+        // Budget is large. The partial fits → exact same byte stream as
+        // pre-0.3.4 behavior, no `\r\x1b[K`, no dim marker.
+        let mut r = StreamingMarkdownRenderer::new(2, false, true);
+        r.set_term_width_override_for_tests(80);
+        let mut out = Vec::<u8>::new();
+        r.write_chunk("hello", &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains(DIM_MARK), "no dim marker when fitting");
+        assert!(!s.contains("\x1b[K"), "no row-clear when fitting");
+        assert!(!r.partial_overflowed_for_tests());
+    }
+
+    #[test]
+    fn overflow_renders_single_row_with_dim_marker_and_tail() {
+        // pad(2) + 26 letters at width 20 → budget = 18.
+        // Buffer size 26 > 18 → tail-window: pad + dim `…` + 17 tail cells.
+        let mut r = StreamingMarkdownRenderer::new(2, false, true);
+        r.set_term_width_override_for_tests(20);
+        let mut out = Vec::<u8>::new();
+        r.write_chunk("abcdefghijklmnopqrstuvwxyz", &mut out)
+            .unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains(DIM_MARK), "dim marker present when overflowed");
+        // Visible-stripped form must end with the last 17 chars of input.
+        let visible = strip_ansi(&s);
+        assert!(
+            visible.ends_with("jklmnopqrstuvwxyz"),
+            "tail should be the rightmost 17 cells. Got {visible:?}",
+        );
+        assert_eq!(r.partial_rows_for_tests(), 0);
+        assert!(r.partial_overflowed_for_tests());
+    }
+
+    #[test]
+    fn tail_window_slides_left_as_tokens_arrive() {
+        // First chunk fills the row exactly. Second pushes us into
+        // overflow with a sliding tail. Verify the tail shifts.
+        let mut r = StreamingMarkdownRenderer::new(2, false, true);
+        r.set_term_width_override_for_tests(20); // budget = 18
+        let mut out = Vec::<u8>::new();
+        r.write_chunk("abcdefghijklmnopqr", &mut out).unwrap(); // 18 cells, fits
+        out.clear();
+
+        r.write_chunk("st", &mut out).unwrap();
+        let s1 = String::from_utf8(out).unwrap();
+        assert!(s1.contains(DIM_MARK));
+        let v1 = strip_ansi(&s1);
+        assert!(
+            v1.ends_with("defghijklmnopqrst"),
+            "first overflow tail: {v1:?}"
+        );
+
+        let mut out = Vec::<u8>::new();
+        r.write_chunk("uv", &mut out).unwrap();
+        let s2 = String::from_utf8(out).unwrap();
+        let v2 = strip_ansi(&s2);
+        assert!(
+            v2.ends_with("fghijklmnopqrstuv"),
+            "second overflow tail: {v2:?}"
+        );
+    }
+
+    #[test]
+    fn resize_wider_after_overflow_renders_full_buffer() {
+        // Buffer overflowed at width 20; widen to width 80; next token
+        // should fit again and the overflow flag should clear.
+        let mut r = StreamingMarkdownRenderer::new(2, false, true);
+        r.set_term_width_override_for_tests(20);
+        let mut out = Vec::<u8>::new();
+        r.write_chunk("abcdefghijklmnopqrstuvwxyz", &mut out)
+            .unwrap();
+        assert!(r.partial_overflowed_for_tests());
+
+        r.set_term_width_override_for_tests(80);
+        let mut out = Vec::<u8>::new();
+        // Even a 1-byte token after a resize-wider should drop back to
+        // the no-truncation rendering.
+        r.write_chunk("!", &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains(DIM_MARK), "no dim marker after partial refits");
+        let visible = strip_ansi(&s);
+        // The new repaint contains the full buffer.
+        assert!(visible.contains("abcdefghijklmnopqrstuvwxyz!"));
+        assert!(!r.partial_overflowed_for_tests());
+    }
+
+    #[test]
+    fn cjk_buffer_overflow_keeps_clusters_intact_in_tail() {
+        // Each kanji is 2 cells. Width 10 → budget 8. Write 10 kanji
+        // (20 cells) → overflow, tail of 7 cells (budget-1 for marker)
+        // → drop clusters from the left until 7-cells suffix fits.
+        let mut r = StreamingMarkdownRenderer::new(2, false, true);
+        r.set_term_width_override_for_tests(10);
+        let mut out = Vec::<u8>::new();
+        r.write_chunk("日本語日本語日本語日", &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains(DIM_MARK));
+        let visible = strip_ansi(&s);
+        // Find the dim marker boundary and check the tail.
+        let mark_pos = visible.find('…').expect("marker in stripped output");
+        let tail: String = visible[mark_pos + '…'.len_utf8()..].to_string();
+        // No orphan kanji bytes. Visible_width of the tail must be even
+        // and `<= 7` (one less than budget for the marker cell).
+        let w = visible_width(&tail);
+        assert!(w <= 7, "tail width {w} exceeds 7 for {tail:?}");
+        assert_eq!(w % 2, 0, "kanji clusters never split (odd width)");
+    }
+
+    #[test]
+    fn vs16_emoji_at_tail_boundary_stays_intact() {
+        // "x⚠️y..." with VS-16. Budget tuned so the cluster lands on
+        // the boundary. We must not orphan VS-16 onto the tail.
+        let mut r = StreamingMarkdownRenderer::new(2, false, true);
+        r.set_term_width_override_for_tests(8); // budget 6
+        let mut out = Vec::<u8>::new();
+        // pad(2) + "ab\u{26A0}\u{FE0F}cdef" = 2 + 1+1+2+1+1+1+1 = 10 cells.
+        r.write_chunk("ab\u{26A0}\u{FE0F}cdef", &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        let visible = strip_ansi(&s);
+        // No bare VS-16 ever appears right after the dim marker.
+        let mark_pos = visible.find('…').expect("marker present");
+        let after_mark = &visible[mark_pos + '…'.len_utf8()..];
+        assert!(
+            !after_mark.starts_with('\u{FE0F}'),
+            "VS-16 orphaned at tail start: {after_mark:?}",
+        );
+    }
+
+    #[test]
+    fn budget_smaller_than_marker_emits_pad_only_no_panic() {
+        // Pathological: pad width >= terminal width. We expect a safe
+        // no-op render with pad emitted and the overflow flag NOT
+        // latched (so a widen-resize repaints from scratch).
+        let mut r = StreamingMarkdownRenderer::new(10, false, true);
+        r.set_term_width_override_for_tests(10);
+        let mut out = Vec::<u8>::new();
+        r.write_chunk("anything", &mut out).unwrap();
+        // No panic, no infinite loop. partial buffer still holds the
+        // content for the eventual newline flush.
+        assert_eq!(r.partial, "anything");
+        assert!(!r.partial_overflowed_for_tests());
+    }
+
+    #[test]
+    fn finish_after_overflow_renders_styled_full_paragraph() {
+        // The whole point of the live row being a *preview*: when the
+        // newline (or EOF / finish) lands, the canonical render is the
+        // full styled paragraph, nothing should be missing from the
+        // buffer just because the live row was truncated.
+        let mut r = StreamingMarkdownRenderer::new(2, false, true);
+        r.set_term_width_override_for_tests(20);
+        let mut out = Vec::<u8>::new();
+        let long: String = "x".repeat(60);
+        r.write_chunk(&long, &mut out).unwrap();
+        assert!(r.partial_overflowed_for_tests());
+        out.clear();
+
+        r.finish(&mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        let visible = strip_ansi(&s);
+        // All 60 x's were committed.
+        assert!(
+            visible.contains(&"x".repeat(60)),
+            "full paragraph rendered on finish. Got {visible:?}",
+        );
+        // Buffer drained and counters reset.
+        assert!(r.partial.is_empty());
+        assert!(!r.partial_overflowed_for_tests());
     }
 }
 

@@ -4,6 +4,10 @@ All notable changes to `mdstream` are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- The live partial row, the in-progress paragraph that re-renders in place while a producer is still streaming, is now projected through a *tail-window* whenever the buffer outgrows the visible budget (`terminal_width - left_pad`). Pre-0.3.4 the partial was allowed to wrap onto multiple physical rows, which made the cursor visibly drop on every byte that crossed a wrap boundary and caused jitter / flicker in hosts that surface the partial inside a fixed UI region (chat panes, IDE sidebars). New behavior: as soon as the buffer would exceed the row, the renderer erases the row and repaints as `pad` + dim `…` + the rightmost `budget - 1` cells of the buffer. The window slides left in lock-step with the producer, the cursor stays anchored to the right edge, and the live partial is *always* exactly one physical row tall regardless of buffer size. The full buffer is preserved verbatim and is what `render_line` renders when the newline finally lands, so no content is lost. Append-only fast path is kept for the common case where the partial fits. The slow erase-and-repaint path only engages on overflow. Resize wider mid-stream automatically refits the buffer in full and drops the dim marker on the next token. Resize narrower auto-engages the tail-window. CJK / VS-16 / combining-mark clusters are never split at the tail boundary (`tail_by_width` walks grapheme clusters, mirroring `wrap_styled_cell`'s atomizer). No new CLI flag. This is a strict UX improvement with no downside: output is byte-identical to 0.3.3 whenever the partial fits.
+
 ## [0.3.3] - 2026-05-14
 
 ### Fixed
