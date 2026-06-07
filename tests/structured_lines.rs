@@ -163,3 +163,34 @@ fn ignores_presentation_only_html_wrapper_lines() {
     let heading = strip_ansi(&renderer.render_line("# Title\n"));
     assert_eq!(heading, "Title\n━━━━━\n");
 }
+
+// ===========================================================================
+// Batch E: trailing whitespace (and a trailing hard-break backslash) on a
+// rendered text line must be stripped from the visible output. mdstream emits
+// each source line as its own terminal line, so a hard break is implicit; the
+// only defect is leaking the trailing spaces / backslash.
+// ===========================================================================
+
+#[test]
+fn trailing_spaces_stripped_from_paragraph() {
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let out = strip_ansi(&r.render_line("line one  \n"));
+    assert_eq!(out, "line one\n", "trailing spaces leaked: {out:?}");
+}
+
+#[test]
+fn trailing_hard_break_backslash_stripped() {
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let out = strip_ansi(&r.render_line("line one\\\n"));
+    assert_eq!(out, "line one\n", "trailing backslash leaked: {out:?}");
+}
+
+#[test]
+fn trailing_whitespace_kept_inside_code_block() {
+    // Inside fenced code, trailing whitespace is significant and must NOT be
+    // stripped (it is content).
+    let mut r = StreamingMarkdownRenderer::new(0, false, true);
+    let _ = r.render_line("```\n");
+    let body = strip_ansi(&r.render_line("code   \n"));
+    assert!(body.contains("code   "), "code trailing space wrongly stripped: {body:?}");
+}

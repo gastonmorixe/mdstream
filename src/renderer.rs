@@ -1417,7 +1417,25 @@ impl StreamingMarkdownRenderer {
     }
 
     pub fn render_line(&mut self, line: &str) -> String {
-        let stripped = line.trim_end_matches('\n');
+        let raw = line.trim_end_matches('\n');
+        // Outside code blocks, trailing whitespace is insignificant and a
+        // trailing hard-break backslash (CommonMark 6.7) is dropped: mdstream
+        // already emits each source line on its own terminal row, so the break
+        // is implicit. Inside code blocks trailing whitespace is content and
+        // must be preserved, so only strip on the non-code path.
+        let stripped: &str = if self.in_code_block {
+            raw
+        } else {
+            let t = raw.trim_end();
+            // A single trailing '\' on an otherwise-stripped line is a hard
+            // line break marker; drop it. (Two backslashes => the last is a
+            // literal escaped backslash, leave to inline escaping.)
+            if t.ends_with('\\') && !t.ends_with("\\\\") {
+                &t[..t.len() - 1]
+            } else {
+                t
+            }
+        };
         let ignored_html = !self.in_code_block && ignored_html_wrapper_tag(stripped);
         let rendered = if ignored_html {
             self.clear_list_state();
