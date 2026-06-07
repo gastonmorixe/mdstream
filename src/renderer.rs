@@ -83,6 +83,28 @@ fn fence_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^(\s*)(```+|~~~+)(.*)$").unwrap())
 }
 
+/// Parse a fence line into `(indent_cols, fence_char, fence_len, info_trimmed)`.
+/// Returns `None` when the line is not a fence at all.
+fn parse_fence(stripped: &str) -> Option<(usize, char, usize, String)> {
+    let caps = fence_re().captures(stripped)?;
+    let indent = caps.get(1).map(|m| m.as_str().chars().count()).unwrap_or(0);
+    let run = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+    let ch = run.chars().next()?;
+    let len = run.chars().count();
+    let info = caps
+        .get(3)
+        .map(|m| m.as_str().trim().to_owned())
+        .unwrap_or_default();
+    Some((indent, ch, len, info))
+}
+
+/// A fence line is a valid OPENER when its indent is <= 3 and, for backtick
+/// fences, the info string contains no backtick (CommonMark §4.5: a ``` info
+/// string may not contain a backtick, otherwise the line is a paragraph).
+fn is_fence_opener(indent: usize, ch: char, info: &str) -> bool {
+    indent <= 3 && (ch == '~' || !info.contains('`'))
+}
+
 fn task_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^(\s*)([-*+])\s+\[([ xX])\]\s+(.*)$").unwrap())
@@ -950,6 +972,11 @@ pub struct StreamingMarkdownRenderer {
     previous_was_blank: bool,
     in_code_block: bool,
     code_lang: String,
+    /// The fence character (`` ` `` or `~`) that opened the active code
+    /// block, and how many of them. A closer must use the SAME character
+    /// and be at least this long (CommonMark 0.31.2 §4.5).
+    code_fence_char: char,
+    code_fence_len: usize,
     code_line_num: usize,
     show_lineno: bool,
     code_theme: CodeTheme,
@@ -1071,6 +1098,8 @@ impl StreamingMarkdownRenderer {
             previous_was_blank: true,
             in_code_block: false,
             code_lang: String::new(),
+            code_fence_char: '`',
+            code_fence_len: 0,
             code_line_num: 0,
             show_lineno,
             code_theme,
@@ -1426,9 +1455,11 @@ impl StreamingMarkdownRenderer {
     }
 
     fn render_noncode_line_without_table(&mut self, stripped: &str) -> String {
-        if let Some(captures) = fence_re().captures(stripped) {
+        if let Some((indent, ch, len, info)) = parse_fence(stripped)
+            && is_fence_opener(indent, ch, &info)
+        {
             self.clear_list_state();
-            return self.render_code_fence(captures.get(3).map(|m| m.as_str()).unwrap_or_default());
+            return self.open_code_fence(ch, len, &info);
         }
 
         if looks_like_table_row(stripped) {
@@ -1490,45 +1521,56 @@ impl StreamingMarkdownRenderer {
         format!("{table}{current}")
     }
 
-    fn render_code_fence(&mut self, rest: &str) -> String {
-        if !self.in_code_block {
-            self.code_lang = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_owned();
-            self.in_code_block = true;
-            self.code_line_num = 0;
-            self.code_highlighter = Some(Self::make_code_highlighter(
-                &self.code_lang,
-                self.code_theme,
-            ));
+    fn open_code_fence(&mut self, ch: char, len: usize, info: &str) -> String {
+        self.code_lang = info.split_whitespace().next().unwrap_or_default().to_owned();
+        self.in_code_block = true;
+        self.code_fence_char = ch;
+        self.code_fence_len = len;
+        self.code_line_num = 0;
+        self.code_highlighter = Some(Self::make_code_highlighter(&self.code_lang, self.code_theme));
 
-            if self.code_lang.is_empty() {
-                return format!("{}{}{}{}\n", self.pad, DIM, "─".repeat(40), RESET);
-            }
-
-            let color = lang_color(&self.code_lang.to_lowercase());
-            let label = format!("{RESET} {color}{BOLD}{}{RESET} ", self.code_lang);
-            let tail = 38usize
-                .saturating_sub(self.code_lang.chars().count() + 2)
-                .max(1);
-            return format!(
-                "{}{}──{}{}{}{}\n",
-                self.pad,
-                DIM,
-                label,
-                DIM,
-                "─".repeat(tail),
-                RESET
-            );
+        if self.code_lang.is_empty() {
+            return format!("{}{}{}{}\n", self.pad, DIM, "─".repeat(40), RESET);
         }
 
+        let color = lang_color(&self.code_lang.to_lowercase());
+        let label = format!("{RESET} {color}{BOLD}{}{RESET} ", self.code_lang);
+        let tail = 38usize
+            .saturating_sub(self.code_lang.chars().count() + 2)
+            .max(1);
+        format!(
+            "{}{}──{}{}{}{}\n",
+            self.pad,
+            DIM,
+            label,
+            DIM,
+            "─".repeat(tail),
+            RESET
+        )
+    }
+
+    fn close_code_fence(&mut self) -> String {
         self.in_code_block = false;
         self.code_lang.clear();
+        self.code_fence_len = 0;
         self.code_line_num = 0;
         self.code_highlighter = None;
         format!("{}{}{}{}\n", self.pad, DIM, "─".repeat(40), RESET)
+    }
+
+    /// Is `stripped` a valid CLOSER for the currently-open fence? Must be the
+    /// same fence char, at least as long, indented <=3, and carry no trailing
+    /// non-whitespace text (CommonMark §4.5).
+    fn is_fence_closer(&self, stripped: &str) -> bool {
+        match parse_fence(stripped) {
+            Some((indent, ch, len, info)) => {
+                indent <= 3
+                    && ch == self.code_fence_char
+                    && len >= self.code_fence_len
+                    && info.is_empty()
+            }
+            None => false,
+        }
     }
 
     fn make_code_highlighter(lang: &str, code_theme: CodeTheme) -> HighlightLines<'static> {
@@ -1541,8 +1583,8 @@ impl StreamingMarkdownRenderer {
     }
 
     fn render_code_line(&mut self, stripped: &str) -> String {
-        if let Some(captures) = fence_re().captures(stripped) {
-            return self.render_code_fence(captures.get(3).map(|m| m.as_str()).unwrap_or_default());
+        if self.is_fence_closer(stripped) {
+            return self.close_code_fence();
         }
 
         self.code_line_num += 1;

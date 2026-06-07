@@ -123,3 +123,73 @@ fn typescript_fences_fall_back_to_javascript_highlighting() {
     assert!(line.contains("\x1b[38;2;123;167;255mfunction"));
     assert!(line.contains("\x1b[38;2;96;214;255mgreet"));
 }
+
+// ===========================================================================
+// Batch A: CommonMark fence-closer rules. A closing fence must use the SAME
+// fence character as the opener, be at least as long, be indented <=3 spaces,
+// and carry no trailing non-whitespace text. Opener may not have a backtick
+// in its info string (for ``` fences).
+// ===========================================================================
+
+#[test]
+fn four_backtick_fence_keeps_inner_triple_backticks() {
+    // K1: a 4-backtick fence is NOT closed by an inner ``` line.
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let mut out = String::new();
+    for l in ["````markdown\n", "```rust\n", "fn x(){}\n", "```\n", "````\n", "after\n"] {
+        out.push_str(&strip_ansi(&r.render_line(l)));
+    }
+    assert!(out.contains("```rust"), "inner ```rust must be literal content: {out:?}");
+    assert!(out.contains("fn x(){}"), "code body missing: {out:?}");
+    // 'after' is outside the code block
+    assert!(out.contains("after"), "trailing text missing: {out:?}");
+}
+
+#[test]
+fn closing_fence_with_trailing_text_is_not_a_closer() {
+    // K2: '``` aaa' carries trailing text, so it cannot close; it's content.
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let mut out = String::new();
+    for l in ["```\n", "``` aaa\n", "```\n", "after\n"] {
+        out.push_str(&strip_ansi(&r.render_line(l)));
+    }
+    assert!(out.contains("aaa"), "content 'aaa' lost: {out:?}");
+    assert!(out.contains("after"), "trailing text missing: {out:?}");
+}
+
+#[test]
+fn backtick_fence_not_closed_by_tilde_line() {
+    // A ~~~ line inside a ``` fence is literal content.
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let mut out = String::new();
+    for l in ["```\n", "aaa\n", "~~~\n", "```\n", "after\n"] {
+        out.push_str(&strip_ansi(&r.render_line(l)));
+    }
+    assert!(out.contains("aaa"), "content missing: {out:?}");
+    assert!(out.contains("~~~"), "tilde line must be literal content: {out:?}");
+    assert!(out.contains("after"), "trailing text missing: {out:?}");
+}
+
+#[test]
+fn tilde_fence_not_closed_by_backtick_line() {
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let mut out = String::new();
+    for l in ["~~~\n", "code\n", "```\n", "more\n", "~~~\n", "after\n"] {
+        out.push_str(&strip_ansi(&r.render_line(l)));
+    }
+    assert!(out.contains("```"), "backtick line must be literal inside ~~~ fence: {out:?}");
+    assert!(out.contains("code") && out.contains("more"), "content missing: {out:?}");
+    assert!(out.contains("after"), "trailing text missing: {out:?}");
+}
+
+#[test]
+fn shorter_closing_fence_does_not_close_longer_opener() {
+    // Opener ````, a ``` line is too short to close.
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let mut out = String::new();
+    for l in ["````\n", "aaa\n", "```\n", "bbb\n", "````\n", "after\n"] {
+        out.push_str(&strip_ansi(&r.render_line(l)));
+    }
+    assert!(out.contains("aaa") && out.contains("bbb"), "content missing: {out:?}");
+    assert!(out.contains("after"), "trailing text missing: {out:?}");
+}
