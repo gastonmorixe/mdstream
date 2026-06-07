@@ -294,3 +294,27 @@ fn thematic_break_falls_back_to_40_when_width_unknown() {
     let out = strip_ansi(&r.render_line("---\n"));
     assert_eq!(out, "────────────────────────────────────────\n");
 }
+
+// ===========================================================================
+// Batch I: collapse consecutive blank lines to one; strip 1-3 leading spaces
+// from a plain paragraph line (CommonMark: a paragraph's leading whitespace
+// is not significant; 4+ would be a code block).
+// ===========================================================================
+
+#[test]
+fn consecutive_blank_lines_collapse() {
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let mut out = String::new();
+    for l in ["a\n", "\n", "\n", "\n", "b\n"] {
+        out.push_str(&strip_ansi(&r.render_line(l)));
+    }
+    // Exactly one blank line between the two paragraphs.
+    assert_eq!(out, "a\n\nb\n", "blank lines not collapsed: {out:?}");
+}
+
+#[test]
+fn leading_spaces_stripped_from_paragraph() {
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let out = strip_ansi(&r.render_line("   indented para\n"));
+    assert_eq!(out, "indented para\n", "leading spaces not stripped: {out:?}");
+}

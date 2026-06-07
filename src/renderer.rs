@@ -1977,11 +1977,23 @@ impl StreamingMarkdownRenderer {
 
         if text.is_empty() {
             self.clear_list_state();
-            return "\n".to_owned();
+            // Collapse consecutive blank lines: a run of blanks is one
+            // paragraph break (CommonMark). If the previous emitted line was
+            // already blank, swallow this one.
+            return if self.previous_was_blank {
+                String::new()
+            } else {
+                "\n".to_owned()
+            };
         }
 
         self.clear_list_state();
-        format!("{prefix}{}\n", format_inline(text, self.inline_code_color))
+        // A plain paragraph's leading whitespace is not significant; strip 1-3
+        // leading spaces. A run of 4+ leading spaces is left intact (that's an
+        // indented-code-block indent in CommonMark).
+        let lead = text.len() - text.trim_start_matches(' ').len();
+        let body = if (1..=3).contains(&lead) { &text[lead..] } else { text };
+        format!("{prefix}{}\n", format_inline(body, self.inline_code_color))
     }
 
     fn flush_buffered_table(&mut self) -> String {
