@@ -27,6 +27,10 @@ const ITALIC_OFF: &str = "\x1b[23m";
 const UNDERLINE_OFF: &str = "\x1b[24m";
 const STRIKETHROUGH_OFF: &str = "\x1b[29m";
 const FG_DEFAULT: &str = "\x1b[39m";
+/// Fixed width of the framing rule that brackets a fenced code block (open
+/// label line and closing border). Kept constant so the top and bottom of a
+/// code block always line up regardless of terminal width.
+const CODE_FRAME_WIDTH: usize = 40;
 const BRIGHT_BLUE: &str = "\x1b[94m";
 const BRIGHT_GREEN: &str = "\x1b[92m";
 const BRIGHT_MAGENTA: &str = "\x1b[95m";
@@ -1802,7 +1806,7 @@ impl StreamingMarkdownRenderer {
         self.code_highlighter = Some(Self::make_code_highlighter(&self.code_lang, self.code_theme));
 
         if self.code_lang.is_empty() {
-            return format!("{}{}{}{}\n", self.pad, DIM, "─".repeat(40), RESET);
+            return format!("{}{}{}{}\n", self.pad, DIM, "─".repeat(CODE_FRAME_WIDTH), RESET);
         }
 
         let color = lang_color(&self.code_lang.to_lowercase());
@@ -1827,7 +1831,7 @@ impl StreamingMarkdownRenderer {
         self.code_fence_len = 0;
         self.code_line_num = 0;
         self.code_highlighter = None;
-        format!("{}{}{}{}\n", self.pad, DIM, "─".repeat(40), RESET)
+        format!("{}{}{}{}\n", self.pad, DIM, "─".repeat(CODE_FRAME_WIDTH), RESET)
     }
 
     /// Is `stripped` a valid CLOSER for the currently-open fence? Must be the
@@ -1935,7 +1939,7 @@ impl StreamingMarkdownRenderer {
 
         if rule_re().is_match(text) {
             self.clear_list_state();
-            return format!("{prefix}{DIM}{}{RESET}\n", "─".repeat(40));
+            return format!("{prefix}{DIM}{}{RESET}\n", "─".repeat(self.rule_width()));
         }
 
         if let Some(captures) = task_re().captures(text) {
@@ -2136,6 +2140,16 @@ impl StreamingMarkdownRenderer {
             .ok()
             .map(|(c, _)| usize::from(c))
             .filter(|n| *n > 0)
+    }
+
+    /// Width for full-line rules (thematic breaks, empty-fence borders): the
+    /// live terminal width minus the left padding when known, else a 40-cell
+    /// fallback (matches the historic default for piped/unknown output).
+    fn rule_width(&self) -> usize {
+        match self.detect_live_columns() {
+            Some(cols) => cols.saturating_sub(self.pad.chars().count()).max(1),
+            None => 40,
+        }
     }
 
     /// Allocate column widths that sum (with separators + cell

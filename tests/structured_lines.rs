@@ -256,3 +256,41 @@ fn atx_h1_rule_width_matches_visible_text() {
     assert_eq!(lines[0].width(), lines[1].width(),
         "rule width != title width: {:?} vs {:?}", lines[0], lines[1]);
 }
+
+// ===========================================================================
+// Batch J: thematic-break and empty-code-fence rule width should track the
+// live terminal width when known (capped), and fall back to 40 when not.
+// ===========================================================================
+
+#[test]
+fn thematic_break_scales_to_terminal_width() {
+    use unicode_width::UnicodeWidthStr;
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    r.set_term_width_override_for_tests(20);
+    let out = strip_ansi(&r.render_line("---\n"));
+    let rule = out.trim_end_matches('\n');
+    assert_eq!(rule.width(), 20, "HR should be 20 cells at width 20: {rule:?}");
+}
+
+#[test]
+fn thematic_break_wide_terminal() {
+    use unicode_width::UnicodeWidthStr;
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    r.set_term_width_override_for_tests(100);
+    let out = strip_ansi(&r.render_line("***\n"));
+    let rule = out.trim_end_matches('\n');
+    assert_eq!(rule.width(), 100, "HR should fill width 100: {rule:?}");
+}
+
+#[test]
+fn thematic_break_falls_back_to_40_when_width_unknown() {
+    // No override; in the test process stdout is not a TTY and COLUMNS is
+    // typically unset -> detect returns None -> fallback 40.
+    // (Guard: only assert when COLUMNS is actually unset.)
+    if std::env::var("COLUMNS").is_ok() {
+        return;
+    }
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let out = strip_ansi(&r.render_line("---\n"));
+    assert_eq!(out, "────────────────────────────────────────\n");
+}

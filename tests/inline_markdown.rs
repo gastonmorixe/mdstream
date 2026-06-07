@@ -6,6 +6,9 @@ use support::strip_ansi;
 #[test]
 fn renders_inline_markdown_and_rules() {
     let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+    // Pin width so the thematic-break rule is deterministic regardless of
+    // whether the test harness runs attached to a TTY.
+    renderer.set_term_width_override_for_tests(40);
 
     let styled = strip_ansi(&renderer.render_line(
         "***both*** **bold** *italic* ~~gone~~ `code` <https://a.test> https://b.test\n",
