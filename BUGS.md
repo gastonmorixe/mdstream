@@ -639,3 +639,30 @@ TOTAL VERIFIED BUGS: 16
 
 ---
 TOTAL CATALOGED: 98 (files) + 3 known (K1-K3) + 1 fixed (F0) = 102
+
+---
+## Deliberate non-fixes (architectural constraints)
+
+### Setext headings (`Title\n===` / `Title\n---`)  [won't-fix-by-design]
+mdstream is a STREAMING renderer: each line is emitted immediately, and the
+live display erases+repaints the in-flight partial line on every newline
+(`write_chunk` -> `erase_partial` -> `render_line`). Setext requires looking
+BACK at the already-emitted previous line and restyling it as a heading once
+the underline arrives. Deferring the paragraph line to wait for a possible
+underline would (a) make the final line of every message appear only at stream
+end, and (b) cause typed text to be erased and repainted a line late, i.e.
+visible flicker/disappearance during streaming. The dominant heading form,
+ATX (`# Title`), is fully supported and was hardened in this campaign. Setext
+is rare in LLM/tool output, so we keep the streaming UX intact and treat a
+setext underline as a thematic break / literal line rather than buffer.
+
+### Full reference-link / link-reference-definition resolution  [won't-fix-by-design]
+`[text][ref]` ... `[ref]: /url` requires collecting link definitions from the
+WHOLE document before resolving references that may appear earlier. A streaming
+line-by-line renderer never has the whole document in hand. Inline links
+(`[text](url)`) are fully supported.
+
+### Width-aware paragraph soft-wrapping  [by-design]
+mdstream does not hard-wrap paragraph text; it relies on the terminal's own
+soft-wrap. This is intentional (keeps output copy-pasteable and lets the
+terminal reflow on resize). Tables DO get width-aware wrapping via --table-fit.
