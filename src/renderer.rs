@@ -170,7 +170,13 @@ fn table_candidate_re() -> &'static Regex {
 
 fn table_separator_cell_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^:?-{3,}:?$").unwrap())
+    // GFM requires only ONE hyphen per delimiter cell, optionally wrapped
+    // in alignment colons: `-`, `:-`, `-:`, `:-:`, `--:`, `:--`, etc. The
+    // old `{3,}` quantifier rejected every alignment delimiter with fewer
+    // than 3 dashes (`--:`, `:-:`, ...), so valid GFM tables leaked as raw
+    // `| ... |` markdown. `-+` matches one-or-more, while still rejecting
+    // colon-only cells (`:`, `::`) which carry no hyphen.
+    RE.get_or_init(|| Regex::new(r"^:?-+:?$").unwrap())
 }
 
 struct SyntectAssets {

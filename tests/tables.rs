@@ -700,3 +700,97 @@ fn table_fit_max_mode_does_not_widen_short_tables() {
         "natural shape lost: short={short_len} long={long_len}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression: GFM delimiter rows allow ONE hyphen per cell, optionally
+// wrapped in colons (`-`, `:-`, `-:`, `:-:`, `--:`, `:--`). mdstream's
+// `table_separator_cell_re` used `^:?-{3,}:?$`, demanding >= 3 hyphens, so
+// any alignment delimiter with 1-2 dashes failed to promote and the raw
+// `| ... |` markdown leaked into the terminal. Reproduced from session
+// 517eb994 (a financial scenario grid using `|---|--:|--:|...`).
+// ---------------------------------------------------------------------------
+
+/// Helper: render a 3-column table whose delimiter row uses `delim` in
+/// each cell and return the closed (flushed) plain-text output.
+fn render_with_delim(delim: &str) -> String {
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+    renderer.set_term_width_override_for_tests(120);
+    let _ = renderer.render_line("| A | B | C |\n");
+    let _ = renderer.render_line(&format!("|{delim}|{delim}|{delim}|\n"));
+    let _ = renderer.render_line("| 1 | 2 | 3 |\n");
+    strip_ansi(&renderer.render_line("after\n"))
+}
+
+#[test]
+fn short_alignment_delimiters_promote_to_table() {
+    for delim in [
+        "-", "--", "---", ":-", "-:", ":-:", ":--", "--:", ":---", "---:", ":---:", ":--:",
+    ] {
+        let out = render_with_delim(delim);
+        assert!(
+            out.contains('\u{2502}') || out.contains('\u{2500}') || out.contains('\u{2501}'),
+            "delimiter {delim:?} failed to promote to a table: {out:?}"
+        );
+        assert!(
+            !out.contains("| A | B | C |"),
+            "delimiter {delim:?} leaked raw markdown header: {out:?}"
+        );
+        assert!(
+            !out.contains(&format!("|{delim}|")),
+            "delimiter {delim:?} leaked raw separator: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn two_dash_alignment_delimiter_preserves_alignment() {
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+    renderer.set_term_width_override_for_tests(120);
+    let _ = renderer.render_line("| Left | Mid | Right |\n");
+    let _ = renderer.render_line("| :-- | :-: | --: |\n");
+    let _ = renderer.render_line("| a | b | ccccc |\n");
+    let closed = strip_ansi(&renderer.render_line("after\n"));
+
+    assert!(
+        closed.contains('\u{2502}'),
+        "alignment delimiter row did not promote: {closed:?}"
+    );
+    assert!(
+        !closed.contains("| :-- |"),
+        "raw separator leaked: {closed:?}"
+    );
+    assert!(closed.contains("ccccc"), "body cell missing: {closed:?}");
+}
+
+#[test]
+fn session_517eb994_scenario_grid_renders_as_table() {
+    let mut renderer = StreamingMarkdownRenderer::new(0, true, true);
+    renderer.set_term_width_override_for_tests(146);
+    let _ = renderer.render_line("| Rate move | IEF | Bond P&L | Collar payoff | **Net P&L** |\n");
+    let _ = renderer.render_line("|---|--:|--:|--:|--:|\n");
+    let _ = renderer
+        .render_line("| -200bp (rates fall hard) | $106.73 | +$48,553 | -$40,244 | **+$8,309** |\n");
+    let _ = renderer.render_line("| 0bp (flat) | $93.62 | $0 | -$555 | **-$555** |\n");
+    let closed = strip_ansi(&renderer.render_line("after\n"));
+
+    assert!(
+        closed.contains('\u{2502}') && closed.contains('\u{2501}'),
+        "scenario grid failed to render as a table: {closed:?}"
+    );
+    assert!(
+        !closed.contains("| Rate move |"),
+        "raw markdown header leaked: {closed:?}"
+    );
+    assert!(
+        !closed.contains("|---|--:|"),
+        "raw separator leaked: {closed:?}"
+    );
+    assert!(
+        closed.contains("Bond P&L"),
+        "header content missing: {closed:?}"
+    );
+    assert!(
+        closed.contains("$106.73"),
+        "body content missing: {closed:?}"
+    );
+}

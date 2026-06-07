@@ -4,6 +4,20 @@ All notable changes to `mdstream` are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-06-07
+
+### Fixed
+
+- GFM table delimiter rows with fewer than three hyphens per cell now promote to a rendered table instead of leaking as raw `| ... |` markdown. `table_separator_cell_re` used `^:?-{3,}:?# Changelog
+
+All notable changes to `mdstream` are documented in this file.
+
+, which demanded at least 3 hyphens and so rejected every short alignment delimiter the GFM spec permits (`-`, `--`, `:-`, `-:`, `:-:`, `--:`, `:--`). Any table whose separator row used these, e.g. `|---|--:|--:|`, failed to enter table mode and the header, separator, and body all rendered as literal markdown source. Fix: relax the quantifier to `^:?-+:?# Changelog
+
+All notable changes to `mdstream` are documented in this file.
+
+ (one-or-more hyphens), which still rejects colon-only cells (`:`, `::`) that carry no hyphen. Reproduced from a financial scenario grid using `|---|--:|--:|...`; regression tests in `tests/tables.rs`.
+
 ## [0.3.4] - 2026-05-20
 
 ### Changed
