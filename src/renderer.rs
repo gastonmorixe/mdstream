@@ -181,8 +181,13 @@ fn link_re() -> &'static Regex {
 }
 
 fn autolink_re() -> &'static Regex {
+    // Any scheme:rest in angle brackets is a CommonMark autolink, plus bare
+    // email autolinks `<addr@host>`. We render the inner text styled either
+    // way. (Scheme must be a letter followed by letters/digits/+/-/.)
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"<(https?://[^>\s]+)>").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"<([a-zA-Z][a-zA-Z0-9+.-]*:[^>\s]+|[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+)>").unwrap()
+    })
 }
 
 fn bare_url_re() -> &'static Regex {
@@ -858,8 +863,30 @@ fn restore_placeholders(mut text: String, placeholders: &[String]) -> String {
     text
 }
 
-fn render_link(label: &str, url: &str) -> String {
+fn render_link(label: &str, dest: &str) -> String {
+    // The destination may carry an optional CommonMark title:
+    //   /url "title"  |  /url 'title'  |  /url (title)
+    // Strip it so only the URL is shown.
+    let url = strip_link_title(dest);
     format!("{UNDERLINE}{BRIGHT_BLUE}{label}{FG_DEFAULT}{UNDERLINE_OFF}{DIM} ({url}){FG_DEFAULT}{BOLD_OFF}")
+}
+
+/// Drop a trailing link title from a CommonMark link destination, returning
+/// just the URL (trimmed). Handles `"..."`, `'...'`, and `(...)` titles.
+fn strip_link_title(dest: &str) -> &str {
+    let d = dest.trim();
+    // Find the first whitespace that separates URL from title.
+    if let Some(ws) = d.find(char::is_whitespace) {
+        let (url, rest) = d.split_at(ws);
+        let rest = rest.trim_start();
+        if (rest.starts_with('"') && rest.ends_with('"'))
+            || (rest.starts_with('\'') && rest.ends_with('\''))
+            || (rest.starts_with('(') && rest.ends_with(')'))
+        {
+            return url;
+        }
+    }
+    d
 }
 
 fn render_image(alt: &str, url: &str) -> String {

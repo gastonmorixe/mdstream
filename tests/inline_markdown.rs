@@ -342,3 +342,31 @@ fn existing_basic_entities_still_work() {
     let raw = render("&amp; &lt; &gt; &quot; &#39;\n");
     assert_eq!(strip_ansi(&raw), "& < > \" '\n");
 }
+
+// ===========================================================================
+// Batch L: link titles must not leak into the shown URL; email autolinks.
+// ===========================================================================
+
+#[test]
+fn link_title_not_shown_in_url() {
+    let raw = render("[text](/url \"the title\")\n");
+    let plain = strip_ansi(&raw);
+    assert!(plain.contains("text"), "label missing: {plain:?}");
+    assert!(!plain.contains("the title"), "title leaked into output: {plain:?}");
+    assert!(!plain.contains('"'), "quote leaked: {plain:?}");
+}
+
+#[test]
+fn link_without_title_unchanged() {
+    let raw = render("[text](/url)\n");
+    let plain = strip_ansi(&raw);
+    assert!(plain.contains("text") && plain.contains("/url"), "link broke: {plain:?}");
+}
+
+#[test]
+fn email_autolink_is_styled() {
+    let raw = render("<foo@bar.com>\n");
+    let plain = strip_ansi(&raw);
+    assert_eq!(plain, "foo@bar.com\n", "email autolink not unwrapped: {plain:?}");
+    assert!(raw.contains('\x1b'), "email autolink not styled: {raw:?}");
+}
