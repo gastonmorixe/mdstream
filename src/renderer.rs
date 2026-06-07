@@ -82,8 +82,29 @@ const LANG_COLORS: &[(&str, &str)] = &[
 ];
 
 fn heading_re() -> &'static Regex {
+    // CommonMark 4.2: up to 3 leading spaces, 1-6 `#`, then a required space
+    // (or end of line for an empty heading), then the content.
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^(#{1,6})\s+(.*)$").unwrap())
+    RE.get_or_init(|| Regex::new(r"^( {0,3})(#{1,6})(?:[ \t]+(.*?))?[ \t]*$").unwrap())
+}
+
+/// Strip an ATX closing `#` sequence: a run of `#` at the end of the heading
+/// content that is preceded by a space (or is the whole content). A trailing
+/// `#` NOT preceded by a space is literal text (CommonMark ex75).
+fn strip_atx_closing(content: &str) -> &str {
+    let trimmed = content.trim_end();
+    let without = trimmed.trim_end_matches('#');
+    if without.len() == trimmed.len() {
+        return content.trim_end(); // no trailing '#'
+    }
+    if without.is_empty() {
+        return ""; // content was all '#'
+    }
+    if without.ends_with([' ', '\t']) {
+        without.trim_end()
+    } else {
+        content.trim_end() // '#' glued to text => literal
+    }
 }
 
 fn fence_re() -> &'static Regex {
@@ -1886,26 +1907,27 @@ impl StreamingMarkdownRenderer {
     fn render_content_line(&mut self, text: &str, prefix: &str, allow_headings: bool) -> String {
         if allow_headings && let Some(captures) = heading_re().captures(text) {
             self.clear_list_state();
-            let level = captures.get(1).map(|m| m.as_str().len()).unwrap_or(1);
-            let value = captures
-                .get(2)
-                .map(|m| m.as_str())
-                .unwrap_or_default()
-                .trim_end_matches('#')
-                .trim_end();
+            let level = captures.get(2).map(|m| m.as_str().len()).unwrap_or(1);
+            let raw_content = captures.get(3).map(|m| m.as_str()).unwrap_or_default();
+            let value = strip_atx_closing(raw_content);
             let color = PaletteColor::for_heading_level(level).ansi_escape();
             let leading_gap = if self.previous_was_blank { "" } else { "\n" };
-            let heading = format!("{leading_gap}{}{BOLD}{color}{value}{RESET}\n", self.pad);
+            // Format inline markup in the heading content, and size the rule to
+            // the VISIBLE width of the rendered text (ANSI-stripped, display
+            // cells) so wide glyphs and markup don't skew it.
+            let formatted = format_inline(value, self.inline_code_color);
+            let rule_width = visible_width(&formatted);
+            let heading = format!("{leading_gap}{}{BOLD}{color}{formatted}{RESET}\n", self.pad);
             return match level {
                 1 => format!(
                     "{heading}{}{color}{}{RESET}\n",
                     self.pad,
-                    "━".repeat(value.chars().count())
+                    "━".repeat(rule_width)
                 ),
                 2 => format!(
                     "{heading}{}{DIM}{color}{}{RESET}\n",
                     self.pad,
-                    "─".repeat(value.chars().count())
+                    "─".repeat(rule_width)
                 ),
                 _ => heading,
             };

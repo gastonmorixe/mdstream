@@ -194,3 +194,65 @@ fn trailing_whitespace_kept_inside_code_block() {
     let body = strip_ansi(&r.render_line("code   \n"));
     assert!(body.contains("code   "), "code trailing space wrongly stripped: {body:?}");
 }
+
+// ===========================================================================
+// Batch K: ATX heading correctness (CommonMark 4.2).
+//   - a trailing '#' sequence is only a closer when preceded by a space;
+//   - 1-3 leading spaces before the opening '#' are allowed;
+//   - heading content gets inline formatting and the rule width counts
+//     DISPLAY cells of the *visible* text (not markup chars).
+// ===========================================================================
+
+#[test]
+fn atx_trailing_hashes_with_space_are_stripped() {
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let out = strip_ansi(&r.render_line("## foo ##\n"));
+    assert!(out.starts_with("foo\n"), "trailing ## not stripped: {out:?}");
+    assert!(!out.contains('#'), "hash leaked: {out:?}");
+}
+
+#[test]
+fn atx_trailing_hash_without_space_is_literal() {
+    // ex75: '# foo#' -> the '#' is part of the text, content not lost.
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let out = strip_ansi(&r.render_line("# foo#\n"));
+    assert!(out.contains("foo#"), "trailing # wrongly stripped (content loss): {out:?}");
+}
+
+#[test]
+fn atx_leading_spaces_recognized() {
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let out = strip_ansi(&r.render_line("   ### foo\n"));
+    assert!(out.starts_with("foo\n"), "indented heading not recognized: {out:?}");
+    assert!(!out.contains('#'), "marker leaked: {out:?}");
+}
+
+#[test]
+fn atx_four_leading_spaces_is_not_heading() {
+    // 4 spaces => not a heading (would be indented code in real CM, but at
+    // minimum must NOT render as a heading).
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let out = strip_ansi(&r.render_line("    # foo\n"));
+    assert!(out.contains("# foo"), "4-space line wrongly treated as heading: {out:?}");
+}
+
+#[test]
+fn atx_heading_formats_inline_markup() {
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let raw = r.render_line("# Title with `code`\n");
+    let plain = strip_ansi(&raw);
+    assert!(plain.starts_with("Title with code"), "code span not formatted in heading: {plain:?}");
+    assert!(!plain.contains('`'), "backticks leaked in heading: {plain:?}");
+}
+
+#[test]
+fn atx_h1_rule_width_matches_visible_text() {
+    // '# Title **bold**' -> visible "Title bold" = 10 cells; rule should be 10.
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    let plain = strip_ansi(&r.render_line("# Title **bold**\n"));
+    let lines: Vec<&str> = plain.split('\n').filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected title + rule: {plain:?}");
+    use unicode_width::UnicodeWidthStr;
+    assert_eq!(lines[0].width(), lines[1].width(),
+        "rule width != title width: {:?} vs {:?}", lines[0], lines[1]);
+}
