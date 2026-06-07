@@ -990,13 +990,110 @@ fn parse_emphasis(text: &str) -> String {
     out
 }
 
+/// A small but useful slice of the HTML5 named-entity table. Not exhaustive
+/// (the full table is ~2000 entries); covers the entities that actually show
+/// up in prose and LLM output.
+fn named_entity(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "amp" => "&",
+        "lt" => "<",
+        "gt" => ">",
+        "quot" => "\"",
+        "apos" => "'",
+        "nbsp" => "\u{00A0}",
+        "copy" => "\u{00A9}",
+        "reg" => "\u{00AE}",
+        "trade" => "\u{2122}",
+        "mdash" => "\u{2014}",
+        "ndash" => "\u{2013}",
+        "hellip" => "\u{2026}",
+        "deg" => "\u{00B0}",
+        "plusmn" => "\u{00B1}",
+        "times" => "\u{00D7}",
+        "divide" => "\u{00F7}",
+        "frac12" => "\u{00BD}",
+        "frac14" => "\u{00BC}",
+        "frac34" => "\u{00BE}",
+        "laquo" => "\u{00AB}",
+        "raquo" => "\u{00BB}",
+        "ldquo" => "\u{201C}",
+        "rdquo" => "\u{201D}",
+        "lsquo" => "\u{2018}",
+        "rsquo" => "\u{2019}",
+        "bull" => "\u{2022}",
+        "middot" => "\u{00B7}",
+        "euro" => "\u{20AC}",
+        "pound" => "\u{00A3}",
+        "cent" => "\u{00A2}",
+        "yen" => "\u{00A5}",
+        "sect" => "\u{00A7}",
+        "para" => "\u{00B6}",
+        "dagger" => "\u{2020}",
+        "Dagger" => "\u{2021}",
+        "larr" => "\u{2190}",
+        "rarr" => "\u{2192}",
+        "uarr" => "\u{2191}",
+        "darr" => "\u{2193}",
+        "harr" => "\u{2194}",
+        "infin" => "\u{221E}",
+        "ne" => "\u{2260}",
+        "le" => "\u{2264}",
+        "ge" => "\u{2265}",
+        "alpha" => "\u{03B1}",
+        "beta" => "\u{03B2}",
+        "gamma" => "\u{03B3}",
+        "delta" => "\u{03B4}",
+        "pi" => "\u{03C0}",
+        "sigma" => "\u{03C3}",
+        "mu" => "\u{03BC}",
+        "auml" => "\u{00E4}",
+        "ouml" => "\u{00F6}",
+        "uuml" => "\u{00FC}",
+        "szlig" => "\u{00DF}",
+        "eacute" => "\u{00E9}",
+        "egrave" => "\u{00E8}",
+        "ccedil" => "\u{00E7}",
+        "ntilde" => "\u{00F1}",
+        _ => return None,
+    })
+}
+
+/// Decode HTML entities: numeric decimal (`&#NN;`), numeric hex (`&#xNN;`),
+/// and the named entities in [`named_entity`]. Unknown entities are left
+/// verbatim (CommonMark §6.2 keeps unrecognized `&...;` literal).
 fn decode_basic_html_entities(text: &str) -> String {
-    text.replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
+    if !text.contains('&') {
+        return text.to_owned();
+    }
+    let bytes: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == '&'
+            && let Some(semi_rel) = bytes[i + 1..].iter().position(|&c| c == ';')
+        {
+            let semi = i + 1 + semi_rel;
+            let body: String = bytes[i + 1..semi].iter().collect();
+            let decoded = if let Some(rest) = body.strip_prefix('#') {
+                let cp = if let Some(hex) = rest.strip_prefix(['x', 'X']) {
+                    u32::from_str_radix(hex, 16).ok()
+                } else {
+                    rest.parse::<u32>().ok()
+                };
+                cp.filter(|&c| c != 0).and_then(char::from_u32).map(|c| c.to_string())
+            } else {
+                named_entity(&body).map(|s| s.to_owned())
+            };
+            if let Some(s) = decoded {
+                out.push_str(&s);
+                i = semi + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
 }
 
 fn apply_escapes(text: &str, placeholders: &mut Vec<String>) -> String {
@@ -1005,7 +1102,7 @@ fn apply_escapes(text: &str, placeholders: &mut Vec<String>) -> String {
     while let Some(ch) = chars.next() {
         if ch == '\\'
             && let Some(next) = chars.peek().copied()
-            && "\\`*_{}[]()#+-.!>~|".contains(next)
+            && next.is_ascii_punctuation()
         {
             chars.next();
             out.push_str(&stash_placeholder(next.to_string(), placeholders));

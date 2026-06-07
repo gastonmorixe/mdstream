@@ -147,7 +147,8 @@ fn decodes_basic_html_entities() {
             .render_line("**A**&nbsp;&amp;&nbsp;&lt;tag&gt;&nbsp;&quot;x&quot;&nbsp;&#39;y&#39;\n"),
     );
 
-    assert_eq!(rendered, "A & <tag> \"x\" 'y'\n");
+    // &nbsp; decodes to a real non-breaking space (U+00A0), matching HTML.
+    assert_eq!(rendered, "A\u{00A0}&\u{00A0}<tag>\u{00A0}\"x\"\u{00A0}'y'\n");
 }
 
 // ===========================================================================
@@ -291,4 +292,50 @@ fn intraword_asterisk_emphasis_works() {
 fn unmatched_asterisk_run_stays_literal() {
     let raw = render("foo *****\n");
     assert_eq!(strip_ansi(&raw), "foo *****\n", "unmatched run mangled: {raw:?}");
+}
+
+// ===========================================================================
+// Batch F: backslash escapes apply to ALL ASCII punctuation (CommonMark §2.4).
+// Batch G: numeric (&#NN; / &#xNN;) and the common named entities decode.
+// ===========================================================================
+
+#[test]
+fn backslash_escapes_all_ascii_punctuation() {
+    // ex12 class: every ASCII-punct escape drops the backslash, char stays.
+    let raw = render("\\$ \\% \\& \\/ \\: \\; \\< \\= \\? \\@ \\^\n");
+    assert_eq!(strip_ansi(&raw), "$ % & / : ; < = ? @ ^\n", "escape leak: {raw:?}");
+}
+
+#[test]
+fn backslash_before_non_punct_is_literal() {
+    // A backslash before a non-punctuation char is a literal backslash.
+    let raw = render("\\a\\9\n");
+    assert_eq!(strip_ansi(&raw), "\\a\\9\n", "wrongly stripped: {raw:?}");
+}
+
+#[test]
+fn numeric_decimal_entity_decodes() {
+    let raw = render("&#35; &#65;\n");
+    assert_eq!(strip_ansi(&raw), "# A\n", "decimal entity not decoded: {raw:?}");
+}
+
+#[test]
+fn numeric_hex_entity_decodes() {
+    let raw = render("&#x40; &#X23;\n");
+    assert_eq!(strip_ansi(&raw), "@ #\n", "hex entity not decoded: {raw:?}");
+}
+
+#[test]
+fn common_named_entities_decode() {
+    let raw = render("&copy; &reg; &mdash; &hellip;\n");
+    let plain = strip_ansi(&raw);
+    assert!(plain.contains('\u{00A9}'), "&copy; not decoded: {plain:?}");
+    assert!(plain.contains('\u{00AE}'), "&reg; not decoded: {plain:?}");
+    assert!(plain.contains('\u{2014}'), "&mdash; not decoded: {plain:?}");
+}
+
+#[test]
+fn existing_basic_entities_still_work() {
+    let raw = render("&amp; &lt; &gt; &quot; &#39;\n");
+    assert_eq!(strip_ansi(&raw), "& < > \" '\n");
 }
