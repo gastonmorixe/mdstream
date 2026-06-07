@@ -19,6 +19,14 @@ const DIM: &str = "\x1b[2m";
 const ITALIC: &str = "\x1b[3m";
 const UNDERLINE: &str = "\x1b[4m";
 const STRIKETHROUGH: &str = "\x1b[9m";
+// Attribute-specific "off" codes. Closing an inline span with these instead
+// of a blanket RESET (`\x1b[0m`) means an inner style turning off does not
+// strip the outer style from the text that follows on the same line.
+const BOLD_OFF: &str = "\x1b[22m"; // also clears DIM (they share the intensity slot)
+const ITALIC_OFF: &str = "\x1b[23m";
+const UNDERLINE_OFF: &str = "\x1b[24m";
+const STRIKETHROUGH_OFF: &str = "\x1b[29m";
+const FG_DEFAULT: &str = "\x1b[39m";
 const BRIGHT_BLUE: &str = "\x1b[94m";
 const BRIGHT_GREEN: &str = "\x1b[92m";
 const BRIGHT_MAGENTA: &str = "\x1b[95m";
@@ -125,21 +133,6 @@ fn ordered_re() -> &'static Regex {
 fn rule_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^(\s*[-*_]\s*){3,}$").unwrap())
-}
-
-fn bold_italic_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\*\*\*(.+?)\*\*\*").unwrap())
-}
-
-fn bold_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\*\*(.+?)\*\*").unwrap())
-}
-
-fn italic_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\*([^*\n]+)\*").unwrap())
 }
 
 fn strike_re() -> &'static Regex {
@@ -841,12 +834,160 @@ fn restore_placeholders(mut text: String, placeholders: &[String]) -> String {
 }
 
 fn render_link(label: &str, url: &str) -> String {
-    format!("{UNDERLINE}{BRIGHT_BLUE}{label}{RESET}{DIM} ({url}){RESET}")
+    format!("{UNDERLINE}{BRIGHT_BLUE}{label}{FG_DEFAULT}{UNDERLINE_OFF}{DIM} ({url}){FG_DEFAULT}{BOLD_OFF}")
 }
 
 fn render_image(alt: &str, url: &str) -> String {
     let label = if alt.is_empty() { url } else { alt };
-    format!("{DIM}Image:{RESET} {BRIGHT_MAGENTA}{label}{RESET}{DIM} ({url}){RESET}")
+    format!("{DIM}Image:{BOLD_OFF} {BRIGHT_MAGENTA}{label}{FG_DEFAULT}{DIM} ({url}){FG_DEFAULT}{BOLD_OFF}")
+}
+
+/// CommonMark-style emphasis parser for `*` and `_` delimiter runs.
+///
+/// Replaces the old four-regex pipeline (`***`/`**`/`*`) which could not
+/// express flanking and ignored `_` entirely. Implements the practical subset
+/// of the spec's "process emphasis" algorithm via a node list:
+///   - left-flanking: not followed by whitespace, and (not followed by
+///     punctuation, or preceded by whitespace/punctuation);
+///   - right-flanking is the mirror;
+///   - `_` may only open when left-flanking and (not right-flanking or
+///     preceded by punctuation) and close under the mirror rule, which keeps
+///     `foo_bar_baz` literal;
+///   - `**`/`__` => strong, `*`/`_` => emphasis, `***` => both.
+///
+/// Input has already had code spans, links, images, autolinks and backslash
+/// escapes stashed as opaque placeholders, so only emphasis remains.
+fn parse_emphasis(text: &str) -> String {
+    #[derive(Clone)]
+    enum Node {
+        // A literal text chunk.
+        Text(String),
+        // An open ANSI code already committed (from a matched delimiter).
+        Ansi(&'static str),
+        // A run of delimiter characters not yet matched. `count` may shrink
+        // as units are consumed from either end.
+        Delim {
+            ch: char,
+            count: usize,
+            can_open: bool,
+            can_close: bool,
+        },
+    }
+
+    fn is_ws(c: Option<char>) -> bool {
+        c.is_none_or(|c| c.is_whitespace())
+    }
+    fn is_punct(c: Option<char>) -> bool {
+        c.is_some_and(|c| c.is_ascii_punctuation())
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        if c == '*' || c == '_' {
+            let mut j = i;
+            while j < n && chars[j] == c {
+                j += 1;
+            }
+            let before = if i == 0 { None } else { Some(chars[i - 1]) };
+            let after = if j >= n { None } else { Some(chars[j]) };
+            let left = !is_ws(after) && (!is_punct(after) || is_ws(before) || is_punct(before));
+            let right = !is_ws(before) && (!is_punct(before) || is_ws(after) || is_punct(after));
+            let (can_open, can_close) = if c == '_' {
+                (left && (!right || is_punct(before)), right && (!left || is_punct(after)))
+            } else {
+                (left, right)
+            };
+            nodes.push(Node::Delim {
+                ch: c,
+                count: j - i,
+                can_open,
+                can_close,
+            });
+            i = j;
+        } else {
+            if let Some(Node::Text(s)) = nodes.last_mut() {
+                s.push(c);
+            } else {
+                nodes.push(Node::Text(c.to_string()));
+            }
+            i += 1;
+        }
+    }
+
+    // Process: scan left to right for a closer; match to the nearest opener of
+    // the same char to its left. Wrap the nodes between them with ANSI codes.
+    let mut close_idx = 0;
+    while close_idx < nodes.len() {
+        let (cch, cclose, ccount) = match &nodes[close_idx] {
+            Node::Delim { ch, can_close, count, .. } if *can_close && *count > 0 => {
+                (*ch, true, *count)
+            }
+            _ => {
+                close_idx += 1;
+                continue;
+            }
+        };
+        let _ = cclose;
+        let _ = ccount;
+        // find nearest opener to the left
+        let mut open_idx = None;
+        let mut k = close_idx;
+        while k > 0 {
+            k -= 1;
+            if let Node::Delim { ch, can_open, count, .. } = &nodes[k]
+                && *ch == cch
+                && *can_open
+                && *count > 0
+            {
+                open_idx = Some(k);
+                break;
+            }
+        }
+        let Some(oi) = open_idx else {
+            close_idx += 1;
+            continue;
+        };
+        // Determine how many to consume: strong (2) if both have >=2, else 1.
+        let ocount = if let Node::Delim { count, .. } = &nodes[oi] { *count } else { 0 };
+        let cnt2 = if let Node::Delim { count, .. } = &nodes[close_idx] { *count } else { 0 };
+        let take = if ocount >= 2 && cnt2 >= 2 { 2 } else { 1 };
+        let (on, off): (&'static str, &'static str) =
+            if take == 2 { (BOLD, BOLD_OFF) } else { (ITALIC, ITALIC_OFF) };
+
+        // Decrement counts (consume from inner edges).
+        if let Node::Delim { count, .. } = &mut nodes[oi] {
+            *count -= take;
+        }
+        if let Node::Delim { count, .. } = &mut nodes[close_idx] {
+            *count -= take;
+        }
+        // Insert ANSI off just before the closer, ANSI on just after the opener.
+        nodes.insert(close_idx, Node::Ansi(off));
+        nodes.insert(oi + 1, Node::Ansi(on));
+        // After two inserts, indices shifted; restart scan from the opener so
+        // nested pairs inside are processed. Keep close scanning position
+        // roughly where it was.
+        close_idx = oi + 1;
+    }
+
+    // Render: leftover Delim nodes become their literal characters.
+    let mut out = String::new();
+    for node in nodes {
+        match node {
+            Node::Text(s) => out.push_str(&s),
+            Node::Ansi(a) => out.push_str(a),
+            Node::Delim { ch, count, .. } => {
+                for _ in 0..count {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn decode_basic_html_entities(text: &str) -> String {
@@ -884,7 +1025,7 @@ fn format_inline(text: &str, inline_code_color: PaletteColor) -> String {
         .replace_all(&current, |captures: &regex::Captures| {
             stash_placeholder(
                 format!(
-                    "{BOLD}{}{}{RESET}",
+                    "{BOLD}{}{}{FG_DEFAULT}{BOLD_OFF}",
                     inline_code_color.ansi_escape(),
                     captures.get(1).map(|m| m.as_str()).unwrap_or_default()
                 ),
@@ -918,7 +1059,7 @@ fn format_inline(text: &str, inline_code_color: PaletteColor) -> String {
         .replace_all(&current, |captures: &regex::Captures| {
             stash_placeholder(
                 format!(
-                    "{UNDERLINE}{BRIGHT_BLUE}{}{RESET}",
+                    "{UNDERLINE}{BRIGHT_BLUE}{}{FG_DEFAULT}{UNDERLINE_OFF}",
                     captures.get(1).map(|m| m.as_str()).unwrap_or_default()
                 ),
                 &mut placeholders,
@@ -942,7 +1083,7 @@ fn format_inline(text: &str, inline_code_color: PaletteColor) -> String {
             }
             result.push_str(&current[last..start]);
             result.push_str(&stash_placeholder(
-                format!("{UNDERLINE}{BRIGHT_BLUE}{}{RESET}", mat.as_str()),
+                format!("{UNDERLINE}{BRIGHT_BLUE}{}{FG_DEFAULT}{UNDERLINE_OFF}", mat.as_str()),
                 &mut placeholders,
             ));
             last = mat.end();
@@ -950,18 +1091,13 @@ fn format_inline(text: &str, inline_code_color: PaletteColor) -> String {
         result.push_str(&current[last..]);
         result
     };
-    current = bold_italic_re()
-        .replace_all(&current, format!("{BOLD}{ITALIC}$1{RESET}"))
-        .into_owned();
-    current = bold_re()
-        .replace_all(&current, format!("{BOLD}$1{RESET}"))
-        .into_owned();
-    current = italic_re()
-        .replace_all(&current, format!("{ITALIC}$1{RESET}"))
-        .into_owned();
     current = strike_re()
-        .replace_all(&current, format!("{STRIKETHROUGH}$1{RESET}"))
+        .replace_all(&current, format!("{STRIKETHROUGH}$1{STRIKETHROUGH_OFF}"))
         .into_owned();
+    // Emphasis (`*`/`_`) via a flanking-aware delimiter parser. Runs AFTER
+    // code spans/links/images/escapes have been stashed as placeholders and
+    // after strikethrough, so only `*`/`_` runs remain to interpret.
+    current = parse_emphasis(&current);
 
     restore_placeholders(current, &placeholders)
 }

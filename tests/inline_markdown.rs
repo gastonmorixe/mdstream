@@ -149,3 +149,146 @@ fn decodes_basic_html_entities() {
 
     assert_eq!(rendered, "A & <tag> \"x\" 'y'\n");
 }
+
+// ===========================================================================
+// Batch D: nested inline styles must use attribute-specific OFF codes, not a
+// blanket reset, so an inner span closing does not strip the outer style from
+// the text that follows it on the same line.
+// ===========================================================================
+
+fn render(md: &str) -> String {
+    let mut r = StreamingMarkdownRenderer::new(0, true, true);
+    r.render_line(md)
+}
+
+#[test]
+fn bold_inside_italic_keeps_italic_after_inner_span() {
+    // *a **b** c* : after **b** closes, " c" must still be italic.
+    let raw = render("*a **b** c*\n");
+    // find the trailing " c" and confirm italic (ESC[3m) is still active,
+    // i.e. no full reset (ESC[0m) appears before it that isn't re-opened.
+    let idx = raw.find(" c").expect("missing ' c'");
+    let before = &raw[..idx];
+    // italic opened, and not terminated by a full reset before " c"
+    assert!(before.contains("\x1b[3m"), "italic never opened: {raw:?}");
+    assert!(
+        !before[before.rfind("\x1b[3m").unwrap()..].contains("\x1b[0m"),
+        "full reset clobbered italic before ' c': {raw:?}"
+    );
+}
+
+#[test]
+fn italic_inside_bold_keeps_bold_after_inner_span() {
+    let raw = render("**a *b* c**\n");
+    let idx = raw.find(" c").expect("missing ' c'");
+    let before = &raw[..idx];
+    assert!(before.contains("\x1b[1m"), "bold never opened: {raw:?}");
+    assert!(
+        !before[before.rfind("\x1b[1m").unwrap()..].contains("\x1b[0m"),
+        "full reset clobbered bold before ' c': {raw:?}"
+    );
+}
+
+#[test]
+fn code_inside_italic_keeps_italic_after_code() {
+    let raw = render("*a `b` c*\n");
+    let idx = raw.find(" c").expect("missing ' c'");
+    let before = &raw[..idx];
+    assert!(before.contains("\x1b[3m"), "italic never opened: {raw:?}");
+    assert!(
+        !before[before.rfind("\x1b[3m").unwrap()..].contains("\x1b[0m"),
+        "full reset clobbered italic before ' c': {raw:?}"
+    );
+}
+
+#[test]
+fn strike_inside_bold_keeps_bold_after_strike() {
+    let raw = render("**a ~~b~~ c**\n");
+    let idx = raw.find(" c").expect("missing ' c'");
+    let before = &raw[..idx];
+    assert!(before.contains("\x1b[1m"), "bold never opened: {raw:?}");
+    assert!(
+        !before[before.rfind("\x1b[1m").unwrap()..].contains("\x1b[0m"),
+        "full reset clobbered bold before ' c': {raw:?}"
+    );
+}
+
+// ===========================================================================
+// Batch B+C: emphasis must support `_` delimiters AND honor CommonMark
+// flanking (a `*`/`_` adjacent to whitespace on the "inside" cannot open/close,
+// so math like `2*3` and spaced `a * b` stay literal). `_` additionally cannot
+// open/close intra-word.
+// ===========================================================================
+
+#[test]
+fn underscore_italic_is_styled() {
+    let raw = render("_italic_\n");
+    assert!(raw.contains("\x1b[3m"), "underscore italic not styled: {raw:?}");
+    assert_eq!(strip_ansi(&raw), "italic\n");
+}
+
+#[test]
+fn underscore_bold_is_styled() {
+    let raw = render("__bold__\n");
+    assert!(raw.contains("\x1b[1m"), "underscore bold not styled: {raw:?}");
+    assert_eq!(strip_ansi(&raw), "bold\n");
+}
+
+#[test]
+fn underscore_bold_italic_is_styled() {
+    let raw = render("___x___\n");
+    assert!(raw.contains("\x1b[1m") && raw.contains("\x1b[3m"), "not bolditalic: {raw:?}");
+    assert_eq!(strip_ansi(&raw), "x\n");
+}
+
+#[test]
+fn spaced_asterisks_are_literal_not_emphasis() {
+    // 'a * b * c': the '*' are flanked by spaces -> literal, content preserved.
+    let raw = render("a * b * c\n");
+    assert_eq!(strip_ansi(&raw), "a * b * c\n", "spaced asterisks corrupted: {raw:?}");
+    assert!(!raw.contains("\x1b[3m"), "spurious italic: {raw:?}");
+}
+
+#[test]
+fn asterisks_between_digits_preserve_all_text() {
+    // Per CommonMark (ex356 `5*6*78` -> `5<em>6</em>78`), `*` between digits
+    // DOES flank and form emphasis, so `2*3 ... 4*5` legitimately emphasizes
+    // the span between the two asterisks. The property that must always hold
+    // is NO TEXT LOSS: every digit and word survives, only the matched `*`
+    // pair is consumed.
+    let raw = render("2*3 = 6 and 4*5 = 20\n");
+    let plain = strip_ansi(&raw);
+    for tok in ["2", "3 = 6 and 4", "5 = 20"] {
+        assert!(plain.contains(tok), "lost text {tok:?}: {plain:?}");
+    }
+    // exactly the two matched asterisks consumed, none leaked as literal text
+    assert!(!plain.contains('*'), "literal asterisk leaked: {plain:?}");
+}
+
+#[test]
+fn intraword_underscore_is_literal() {
+    let raw = render("foo_bar_baz\n");
+    assert_eq!(strip_ansi(&raw), "foo_bar_baz\n", "intraword underscore emphasized: {raw:?}");
+    assert!(!raw.contains("\x1b[3m"), "spurious italic: {raw:?}");
+}
+
+#[test]
+fn asterisk_emphasis_still_works() {
+    let raw = render("*italic* and **bold**\n");
+    assert!(raw.contains("\x1b[3m") && raw.contains("\x1b[1m"), "asterisk emphasis broke: {raw:?}");
+    assert_eq!(strip_ansi(&raw), "italic and bold\n");
+}
+
+#[test]
+fn intraword_asterisk_emphasis_works() {
+    // foo*bar* : '*' can open/close intra-word for asterisks (unlike '_').
+    let raw = render("foo*bar*\n");
+    assert_eq!(strip_ansi(&raw), "foobar\n");
+    assert!(raw.contains("\x1b[3m"), "intraword asterisk emphasis lost: {raw:?}");
+}
+
+#[test]
+fn unmatched_asterisk_run_stays_literal() {
+    let raw = render("foo *****\n");
+    assert_eq!(strip_ansi(&raw), "foo *****\n", "unmatched run mangled: {raw:?}");
+}
