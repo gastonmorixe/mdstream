@@ -147,7 +147,7 @@ impl PaletteColor {
     pub const fn ansi_escape(self) -> &'static str {
         match self {
             Self::H1 => "\x1b[38;2;255;100;100m",
-            Self::H2 => "\x1b[38;2;255;170;80m",
+            Self::H2 => "\x1b[38;2;96;214;255m",
             Self::H3 => "\x1b[38;2;100;220;100m",
             Self::H4 => "\x1b[38;2;100;180;255m",
             Self::H5 => "\x1b[38;2;180;140;255m",

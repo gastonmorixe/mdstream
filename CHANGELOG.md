@@ -4,6 +4,12 @@ All notable changes to `mdstream` are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-06-30
+
+### Changed
+
+- The H2 (`##`) heading color in the palette changed from yellow/orange (`RGB(255,170,80)`) to a vibrant cyan (`RGB(96,214,255)`), matching the cyan used for function names in the built-in `mdstream` code theme. All six heading levels (H1-H6) remain distinct, vibrant hues.
+
 ## [0.3.5] - 2026-06-07
 
 ### Fixed
