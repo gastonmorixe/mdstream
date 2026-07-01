@@ -768,8 +768,9 @@ fn session_517eb994_scenario_grid_renders_as_table() {
     renderer.set_term_width_override_for_tests(146);
     let _ = renderer.render_line("| Rate move | IEF | Bond P&L | Collar payoff | **Net P&L** |\n");
     let _ = renderer.render_line("|---|--:|--:|--:|--:|\n");
-    let _ = renderer
-        .render_line("| -200bp (rates fall hard) | $106.73 | +$48,553 | -$40,244 | **+$8,309** |\n");
+    let _ = renderer.render_line(
+        "| -200bp (rates fall hard) | $106.73 | +$48,553 | -$40,244 | **+$8,309** |\n",
+    );
     let _ = renderer.render_line("| 0bp (flat) | $93.62 | $0 | -$555 | **-$555** |\n");
     let closed = strip_ansi(&renderer.render_line("after\n"));
 

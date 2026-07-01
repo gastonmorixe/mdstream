@@ -868,7 +868,9 @@ fn render_link(label: &str, dest: &str) -> String {
     //   /url "title"  |  /url 'title'  |  /url (title)
     // Strip it so only the URL is shown.
     let url = strip_link_title(dest);
-    format!("{UNDERLINE}{BRIGHT_BLUE}{label}{FG_DEFAULT}{UNDERLINE_OFF}{DIM} ({url}){FG_DEFAULT}{BOLD_OFF}")
+    format!(
+        "{UNDERLINE}{BRIGHT_BLUE}{label}{FG_DEFAULT}{UNDERLINE_OFF}{DIM} ({url}){FG_DEFAULT}{BOLD_OFF}"
+    )
 }
 
 /// Drop a trailing link title from a CommonMark link destination, returning
@@ -891,7 +893,9 @@ fn strip_link_title(dest: &str) -> &str {
 
 fn render_image(alt: &str, url: &str) -> String {
     let label = if alt.is_empty() { url } else { alt };
-    format!("{DIM}Image:{BOLD_OFF} {BRIGHT_MAGENTA}{label}{FG_DEFAULT}{DIM} ({url}){FG_DEFAULT}{BOLD_OFF}")
+    format!(
+        "{DIM}Image:{BOLD_OFF} {BRIGHT_MAGENTA}{label}{FG_DEFAULT}{DIM} ({url}){FG_DEFAULT}{BOLD_OFF}"
+    )
 }
 
 /// CommonMark-style emphasis parser for `*` and `_` delimiter runs.
@@ -949,7 +953,10 @@ fn parse_emphasis(text: &str) -> String {
             let left = !is_ws(after) && (!is_punct(after) || is_ws(before) || is_punct(before));
             let right = !is_ws(before) && (!is_punct(before) || is_ws(after) || is_punct(after));
             let (can_open, can_close) = if c == '_' {
-                (left && (!right || is_punct(before)), right && (!left || is_punct(after)))
+                (
+                    left && (!right || is_punct(before)),
+                    right && (!left || is_punct(after)),
+                )
             } else {
                 (left, right)
             };
@@ -975,9 +982,12 @@ fn parse_emphasis(text: &str) -> String {
     let mut close_idx = 0;
     while close_idx < nodes.len() {
         let (cch, cclose, ccount) = match &nodes[close_idx] {
-            Node::Delim { ch, can_close, count, .. } if *can_close && *count > 0 => {
-                (*ch, true, *count)
-            }
+            Node::Delim {
+                ch,
+                can_close,
+                count,
+                ..
+            } if *can_close && *count > 0 => (*ch, true, *count),
             _ => {
                 close_idx += 1;
                 continue;
@@ -990,7 +1000,12 @@ fn parse_emphasis(text: &str) -> String {
         let mut k = close_idx;
         while k > 0 {
             k -= 1;
-            if let Node::Delim { ch, can_open, count, .. } = &nodes[k]
+            if let Node::Delim {
+                ch,
+                can_open,
+                count,
+                ..
+            } = &nodes[k]
                 && *ch == cch
                 && *can_open
                 && *count > 0
@@ -1004,11 +1019,22 @@ fn parse_emphasis(text: &str) -> String {
             continue;
         };
         // Determine how many to consume: strong (2) if both have >=2, else 1.
-        let ocount = if let Node::Delim { count, .. } = &nodes[oi] { *count } else { 0 };
-        let cnt2 = if let Node::Delim { count, .. } = &nodes[close_idx] { *count } else { 0 };
+        let ocount = if let Node::Delim { count, .. } = &nodes[oi] {
+            *count
+        } else {
+            0
+        };
+        let cnt2 = if let Node::Delim { count, .. } = &nodes[close_idx] {
+            *count
+        } else {
+            0
+        };
         let take = if ocount >= 2 && cnt2 >= 2 { 2 } else { 1 };
-        let (on, off): (&'static str, &'static str) =
-            if take == 2 { (BOLD, BOLD_OFF) } else { (ITALIC, ITALIC_OFF) };
+        let (on, off): (&'static str, &'static str) = if take == 2 {
+            (BOLD, BOLD_OFF)
+        } else {
+            (ITALIC, ITALIC_OFF)
+        };
 
         // Decrement counts (consume from inner edges).
         if let Node::Delim { count, .. } = &mut nodes[oi] {
@@ -1132,7 +1158,9 @@ fn decode_basic_html_entities(text: &str) -> String {
                 } else {
                     rest.parse::<u32>().ok()
                 };
-                cp.filter(|&c| c != 0).and_then(char::from_u32).map(|c| c.to_string())
+                cp.filter(|&c| c != 0)
+                    .and_then(char::from_u32)
+                    .map(|c| c.to_string())
             } else {
                 named_entity(&body).map(|s| s.to_owned())
             };
@@ -1232,7 +1260,10 @@ fn format_inline(text: &str, inline_code_color: PaletteColor) -> String {
             }
             result.push_str(&current[last..start]);
             result.push_str(&stash_placeholder(
-                format!("{UNDERLINE}{BRIGHT_BLUE}{}{FG_DEFAULT}{UNDERLINE_OFF}", mat.as_str()),
+                format!(
+                    "{UNDERLINE}{BRIGHT_BLUE}{}{FG_DEFAULT}{UNDERLINE_OFF}",
+                    mat.as_str()
+                ),
                 &mut placeholders,
             ));
             last = mat.end();
@@ -1825,15 +1856,28 @@ impl StreamingMarkdownRenderer {
     }
 
     fn open_code_fence(&mut self, ch: char, len: usize, info: &str) -> String {
-        self.code_lang = info.split_whitespace().next().unwrap_or_default().to_owned();
+        self.code_lang = info
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
         self.in_code_block = true;
         self.code_fence_char = ch;
         self.code_fence_len = len;
         self.code_line_num = 0;
-        self.code_highlighter = Some(Self::make_code_highlighter(&self.code_lang, self.code_theme));
+        self.code_highlighter = Some(Self::make_code_highlighter(
+            &self.code_lang,
+            self.code_theme,
+        ));
 
         if self.code_lang.is_empty() {
-            return format!("{}{}{}{}\n", self.pad, DIM, "─".repeat(CODE_FRAME_WIDTH), RESET);
+            return format!(
+                "{}{}{}{}\n",
+                self.pad,
+                DIM,
+                "─".repeat(CODE_FRAME_WIDTH),
+                RESET
+            );
         }
 
         let color = lang_color(&self.code_lang.to_lowercase());
@@ -1858,7 +1902,13 @@ impl StreamingMarkdownRenderer {
         self.code_fence_len = 0;
         self.code_line_num = 0;
         self.code_highlighter = None;
-        format!("{}{}{}{}\n", self.pad, DIM, "─".repeat(CODE_FRAME_WIDTH), RESET)
+        format!(
+            "{}{}{}{}\n",
+            self.pad,
+            DIM,
+            "─".repeat(CODE_FRAME_WIDTH),
+            RESET
+        )
     }
 
     /// Is `stripped` a valid CLOSER for the currently-open fence? Must be the
@@ -2019,7 +2069,11 @@ impl StreamingMarkdownRenderer {
         // leading spaces. A run of 4+ leading spaces is left intact (that's an
         // indented-code-block indent in CommonMark).
         let lead = text.len() - text.trim_start_matches(' ').len();
-        let body = if (1..=3).contains(&lead) { &text[lead..] } else { text };
+        let body = if (1..=3).contains(&lead) {
+            &text[lead..]
+        } else {
+            text
+        };
         format!("{prefix}{}\n", format_inline(body, self.inline_code_color))
     }
 

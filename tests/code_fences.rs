@@ -136,10 +136,20 @@ fn four_backtick_fence_keeps_inner_triple_backticks() {
     // K1: a 4-backtick fence is NOT closed by an inner ``` line.
     let mut r = StreamingMarkdownRenderer::new(0, true, true);
     let mut out = String::new();
-    for l in ["````markdown\n", "```rust\n", "fn x(){}\n", "```\n", "````\n", "after\n"] {
+    for l in [
+        "````markdown\n",
+        "```rust\n",
+        "fn x(){}\n",
+        "```\n",
+        "````\n",
+        "after\n",
+    ] {
         out.push_str(&strip_ansi(&r.render_line(l)));
     }
-    assert!(out.contains("```rust"), "inner ```rust must be literal content: {out:?}");
+    assert!(
+        out.contains("```rust"),
+        "inner ```rust must be literal content: {out:?}"
+    );
     assert!(out.contains("fn x(){}"), "code body missing: {out:?}");
     // 'after' is outside the code block
     assert!(out.contains("after"), "trailing text missing: {out:?}");
@@ -166,7 +176,10 @@ fn backtick_fence_not_closed_by_tilde_line() {
         out.push_str(&strip_ansi(&r.render_line(l)));
     }
     assert!(out.contains("aaa"), "content missing: {out:?}");
-    assert!(out.contains("~~~"), "tilde line must be literal content: {out:?}");
+    assert!(
+        out.contains("~~~"),
+        "tilde line must be literal content: {out:?}"
+    );
     assert!(out.contains("after"), "trailing text missing: {out:?}");
 }
 
@@ -177,8 +190,14 @@ fn tilde_fence_not_closed_by_backtick_line() {
     for l in ["~~~\n", "code\n", "```\n", "more\n", "~~~\n", "after\n"] {
         out.push_str(&strip_ansi(&r.render_line(l)));
     }
-    assert!(out.contains("```"), "backtick line must be literal inside ~~~ fence: {out:?}");
-    assert!(out.contains("code") && out.contains("more"), "content missing: {out:?}");
+    assert!(
+        out.contains("```"),
+        "backtick line must be literal inside ~~~ fence: {out:?}"
+    );
+    assert!(
+        out.contains("code") && out.contains("more"),
+        "content missing: {out:?}"
+    );
     assert!(out.contains("after"), "trailing text missing: {out:?}");
 }
 
@@ -190,6 +209,9 @@ fn shorter_closing_fence_does_not_close_longer_opener() {
     for l in ["````\n", "aaa\n", "```\n", "bbb\n", "````\n", "after\n"] {
         out.push_str(&strip_ansi(&r.render_line(l)));
     }
-    assert!(out.contains("aaa") && out.contains("bbb"), "content missing: {out:?}");
+    assert!(
+        out.contains("aaa") && out.contains("bbb"),
+        "content missing: {out:?}"
+    );
     assert!(out.contains("after"), "trailing text missing: {out:?}");
 }

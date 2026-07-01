@@ -151,7 +151,10 @@ fn decodes_basic_html_entities() {
     );
 
     // &nbsp; decodes to a real non-breaking space (U+00A0), matching HTML.
-    assert_eq!(rendered, "A\u{00A0}&\u{00A0}<tag>\u{00A0}\"x\"\u{00A0}'y'\n");
+    assert_eq!(
+        rendered,
+        "A\u{00A0}&\u{00A0}<tag>\u{00A0}\"x\"\u{00A0}'y'\n"
+    );
 }
 
 // ===========================================================================
@@ -227,21 +230,30 @@ fn strike_inside_bold_keeps_bold_after_strike() {
 #[test]
 fn underscore_italic_is_styled() {
     let raw = render("_italic_\n");
-    assert!(raw.contains("\x1b[3m"), "underscore italic not styled: {raw:?}");
+    assert!(
+        raw.contains("\x1b[3m"),
+        "underscore italic not styled: {raw:?}"
+    );
     assert_eq!(strip_ansi(&raw), "italic\n");
 }
 
 #[test]
 fn underscore_bold_is_styled() {
     let raw = render("__bold__\n");
-    assert!(raw.contains("\x1b[1m"), "underscore bold not styled: {raw:?}");
+    assert!(
+        raw.contains("\x1b[1m"),
+        "underscore bold not styled: {raw:?}"
+    );
     assert_eq!(strip_ansi(&raw), "bold\n");
 }
 
 #[test]
 fn underscore_bold_italic_is_styled() {
     let raw = render("___x___\n");
-    assert!(raw.contains("\x1b[1m") && raw.contains("\x1b[3m"), "not bolditalic: {raw:?}");
+    assert!(
+        raw.contains("\x1b[1m") && raw.contains("\x1b[3m"),
+        "not bolditalic: {raw:?}"
+    );
     assert_eq!(strip_ansi(&raw), "x\n");
 }
 
@@ -249,7 +261,11 @@ fn underscore_bold_italic_is_styled() {
 fn spaced_asterisks_are_literal_not_emphasis() {
     // 'a * b * c': the '*' are flanked by spaces -> literal, content preserved.
     let raw = render("a * b * c\n");
-    assert_eq!(strip_ansi(&raw), "a * b * c\n", "spaced asterisks corrupted: {raw:?}");
+    assert_eq!(
+        strip_ansi(&raw),
+        "a * b * c\n",
+        "spaced asterisks corrupted: {raw:?}"
+    );
     assert!(!raw.contains("\x1b[3m"), "spurious italic: {raw:?}");
 }
 
@@ -272,14 +288,21 @@ fn asterisks_between_digits_preserve_all_text() {
 #[test]
 fn intraword_underscore_is_literal() {
     let raw = render("foo_bar_baz\n");
-    assert_eq!(strip_ansi(&raw), "foo_bar_baz\n", "intraword underscore emphasized: {raw:?}");
+    assert_eq!(
+        strip_ansi(&raw),
+        "foo_bar_baz\n",
+        "intraword underscore emphasized: {raw:?}"
+    );
     assert!(!raw.contains("\x1b[3m"), "spurious italic: {raw:?}");
 }
 
 #[test]
 fn asterisk_emphasis_still_works() {
     let raw = render("*italic* and **bold**\n");
-    assert!(raw.contains("\x1b[3m") && raw.contains("\x1b[1m"), "asterisk emphasis broke: {raw:?}");
+    assert!(
+        raw.contains("\x1b[3m") && raw.contains("\x1b[1m"),
+        "asterisk emphasis broke: {raw:?}"
+    );
     assert_eq!(strip_ansi(&raw), "italic and bold\n");
 }
 
@@ -288,13 +311,20 @@ fn intraword_asterisk_emphasis_works() {
     // foo*bar* : '*' can open/close intra-word for asterisks (unlike '_').
     let raw = render("foo*bar*\n");
     assert_eq!(strip_ansi(&raw), "foobar\n");
-    assert!(raw.contains("\x1b[3m"), "intraword asterisk emphasis lost: {raw:?}");
+    assert!(
+        raw.contains("\x1b[3m"),
+        "intraword asterisk emphasis lost: {raw:?}"
+    );
 }
 
 #[test]
 fn unmatched_asterisk_run_stays_literal() {
     let raw = render("foo *****\n");
-    assert_eq!(strip_ansi(&raw), "foo *****\n", "unmatched run mangled: {raw:?}");
+    assert_eq!(
+        strip_ansi(&raw),
+        "foo *****\n",
+        "unmatched run mangled: {raw:?}"
+    );
 }
 
 // ===========================================================================
@@ -306,7 +336,11 @@ fn unmatched_asterisk_run_stays_literal() {
 fn backslash_escapes_all_ascii_punctuation() {
     // ex12 class: every ASCII-punct escape drops the backslash, char stays.
     let raw = render("\\$ \\% \\& \\/ \\: \\; \\< \\= \\? \\@ \\^\n");
-    assert_eq!(strip_ansi(&raw), "$ % & / : ; < = ? @ ^\n", "escape leak: {raw:?}");
+    assert_eq!(
+        strip_ansi(&raw),
+        "$ % & / : ; < = ? @ ^\n",
+        "escape leak: {raw:?}"
+    );
 }
 
 #[test]
@@ -319,7 +353,11 @@ fn backslash_before_non_punct_is_literal() {
 #[test]
 fn numeric_decimal_entity_decodes() {
     let raw = render("&#35; &#65;\n");
-    assert_eq!(strip_ansi(&raw), "# A\n", "decimal entity not decoded: {raw:?}");
+    assert_eq!(
+        strip_ansi(&raw),
+        "# A\n",
+        "decimal entity not decoded: {raw:?}"
+    );
 }
 
 #[test]
@@ -352,7 +390,10 @@ fn link_title_not_shown_in_url() {
     let raw = render("[text](/url \"the title\")\n");
     let plain = strip_ansi(&raw);
     assert!(plain.contains("text"), "label missing: {plain:?}");
-    assert!(!plain.contains("the title"), "title leaked into output: {plain:?}");
+    assert!(
+        !plain.contains("the title"),
+        "title leaked into output: {plain:?}"
+    );
     assert!(!plain.contains('"'), "quote leaked: {plain:?}");
 }
 
@@ -360,13 +401,19 @@ fn link_title_not_shown_in_url() {
 fn link_without_title_unchanged() {
     let raw = render("[text](/url)\n");
     let plain = strip_ansi(&raw);
-    assert!(plain.contains("text") && plain.contains("/url"), "link broke: {plain:?}");
+    assert!(
+        plain.contains("text") && plain.contains("/url"),
+        "link broke: {plain:?}"
+    );
 }
 
 #[test]
 fn email_autolink_is_styled() {
     let raw = render("<foo@bar.com>\n");
     let plain = strip_ansi(&raw);
-    assert_eq!(plain, "foo@bar.com\n", "email autolink not unwrapped: {plain:?}");
+    assert_eq!(
+        plain, "foo@bar.com\n",
+        "email autolink not unwrapped: {plain:?}"
+    );
     assert!(raw.contains('\x1b'), "email autolink not styled: {raw:?}");
 }
