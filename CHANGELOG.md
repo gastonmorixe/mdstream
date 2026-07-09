@@ -4,6 +4,10 @@ All notable changes to `mdstream` are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- A committed line that is byte-identical to the raw partial already drawn on screen (plain prose with no inline markup) no longer emits a redundant `\r\x1b[K` erase followed by an identical reprint. Previously every line commit — a `\n`, or `finish()` at EOF — unconditionally erased the live partial row and re-emitted the styled render, even when styling changed nothing. On a bare terminal the in-place `\r\x1b[K` hid the duplicate, but a host that pins its own live area below the stream and tracks the cursor itself (an inline-redraw compositor) had no way to know the erase cancelled the first copy, so the line rendered **twice** in scrollback. This bit reasoning models whose final assistant content block carries no trailing newline (the commit is triggered by `finish()` rather than a `\n`), surfacing as a duplicated response. Lines that actually change under styling (bold, code spans, links, headings, list markers, leading-space stripping, tables, and any overflowed/tail-windowed partial) still take the erase + reprint path unchanged. Regression tests in `renderer::duplicate_line_commit_tests`.
+
 ## [0.3.6] - 2026-06-30
 
 ### Changed

@@ -1532,6 +1532,72 @@ impl StreamingMarkdownRenderer {
         rendered
     }
 
+    /// Commit the current partial as a finished line, terminating the row.
+    ///
+    /// `source_line` is the full logical line to render: the partial buffer
+    /// plus any bytes that arrived on the same chunk ahead of the newline.
+    /// `drawn_matches_source` is true when what is currently on screen (the
+    /// raw partial) is the *entire* content being committed, i.e. no extra
+    /// bytes arrived with the newline. It is the caller's promise that the
+    /// on-screen tail row is exactly `pad + self.partial`.
+    ///
+    /// # The duplicate-line fix
+    ///
+    /// While streaming, `append_partial_bytes` draws the partial row as raw,
+    /// unstyled bytes (`pad + partial`). At commit the renderer normally
+    /// erases that row with `\r\x1b[K` and re-emits the *styled* render. For
+    /// plain prose the styled render is byte-identical to what is already on
+    /// screen, so the erase+reprint is pure churn: a bare terminal hides it
+    /// via the in-place erase, but a host that tracks the cursor itself (an
+    /// inline-redraw compositor pinning a live area below the stream) has no
+    /// way to know the `\r\x1b[K` cancelled the first copy, and renders the
+    /// line twice. That is the "response duplicated in scrollback" bug seen
+    /// with reasoning models whose final content block carries no trailing
+    /// newline (so `finish()` — not a `\n` — triggers the commit).
+    ///
+    /// When the styled render (minus its trailing newline) equals the raw
+    /// bytes already on screen, the row is already final: emit a bare `\n`
+    /// and skip the erase + reprint entirely. Nothing on screen changes
+    /// except the cursor moving to the next row, so no downstream host can
+    /// mis-handle a redraw that never happened. Any line that actually
+    /// changes under styling (bold, code spans, links, headings, trailing
+    /// whitespace, leading-space stripping, tables, …) fails the equality
+    /// check and takes the unchanged erase + reprint path.
+    fn commit_partial_line<W: Write>(
+        &mut self,
+        source_line: &str,
+        drawn_matches_source: bool,
+        out: &mut W,
+    ) -> Result<()> {
+        // Render once; `render_line` mutates block state (previous_was_blank,
+        // list/table context) so it must run exactly once per committed line.
+        let styled = self.render_line(&format!("{source_line}\n"));
+
+        // Fast path is only sound when the on-screen tail row is a faithful,
+        // append-only copy of the whole committed line: not projected through
+        // the overflow tail-window, still a single row, and carrying no extra
+        // same-chunk bytes the screen hasn't seen.
+        if drawn_matches_source && !self.partial_overflowed && self.partial_rows == 0 {
+            let on_screen = format!("{}{}", self.pad, self.partial);
+            if styled.strip_suffix('\n') == Some(on_screen.as_str()) {
+                self.partial.clear();
+                self.partial_rows = 0;
+                self.partial_col = 0;
+                self.partial_overflowed = false;
+                writeln!(out)?;
+                return Ok(());
+            }
+        }
+
+        self.erase_partial(out)?;
+        self.partial.clear();
+        self.partial_rows = 0;
+        self.partial_col = 0;
+        self.partial_overflowed = false;
+        write!(out, "{styled}")?;
+        Ok(())
+    }
+
     pub fn write_chunk<W: Write>(&mut self, chunk: &str, out: &mut W) -> Result<()> {
         let parts: Vec<&str> = chunk.split('\n').collect();
         if parts.len() == 1 {
@@ -1553,12 +1619,10 @@ impl StreamingMarkdownRenderer {
         }
 
         let first_complete = format!("{}{}", self.partial, parts[0]);
-        self.erase_partial(out)?;
-        self.partial.clear();
-        self.partial_rows = 0;
-        self.partial_col = 0;
-        self.partial_overflowed = false;
-        write!(out, "{}", self.render_line(&(first_complete + "\n")))?;
+        // The on-screen tail row is `pad + partial`; the committed line adds
+        // `parts[0]`. Only when `parts[0]` is empty do the two coincide and
+        // the skip-the-reprint fast path become eligible.
+        self.commit_partial_line(&first_complete, parts[0].is_empty(), out)?;
 
         for part in &parts[1..parts.len() - 1] {
             write!(out, "{}", self.render_line(&((*part).to_owned() + "\n")))?;
@@ -1584,12 +1648,14 @@ impl StreamingMarkdownRenderer {
 
     pub fn finish<W: Write>(&mut self, out: &mut W) -> Result<()> {
         if !self.partial.is_empty() {
-            self.erase_partial(out)?;
-            let partial = std::mem::take(&mut self.partial);
-            self.partial_rows = 0;
-            self.partial_col = 0;
-            self.partial_overflowed = false;
-            write!(out, "{}", self.render_line(&(partial + "\n")))?;
+            // EOF commit of the trailing partial. The on-screen tail row is
+            // exactly `pad + partial` (no extra same-chunk bytes here), so the
+            // duplicate-skip fast path in commit_partial_line is eligible when
+            // the styled render is byte-identical (plain prose with no
+            // trailing newline). This is the exact path the "duplicated
+            // greeting" bug came in on.
+            let source = self.partial.clone();
+            self.commit_partial_line(&source, true, out)?;
         }
         let buffered = self.flush_buffered_table();
         if !buffered.is_empty() {
@@ -2900,11 +2966,16 @@ mod erase_partial_tests {
 
     #[test]
     fn single_row_partial_uses_cr_clear() {
+        // A single-row partial that RESTYLES on commit (bold markup) still
+        // needs an erase — and it must be the single-row `\r\x1b[K` form, not
+        // the multi-row `\x1b[<n>A\r\x1b[J` rewind. (Plain prose that is
+        // byte-identical to its styled render skips the erase entirely; that
+        // is covered by `duplicate_line_commit_tests`.)
         let mut r = StreamingMarkdownRenderer::new(2, false, true);
         r.set_term_width_override_for_tests(135);
 
         let mut out = Vec::<u8>::new();
-        r.write_chunk("hello world", &mut out).unwrap();
+        r.write_chunk("hello **world**", &mut out).unwrap();
         out.clear();
 
         r.write_chunk("\n", &mut out).unwrap();
@@ -3273,6 +3344,158 @@ mod tail_window_tests {
         // Buffer drained and counters reset.
         assert!(r.partial.is_empty());
         assert!(!r.partial_overflowed_for_tests());
+    }
+}
+
+#[cfg(test)]
+mod duplicate_line_commit_tests {
+    //! Regression coverage for the "response duplicated in scrollback" bug.
+    //!
+    //! While streaming, the trailing partial row is drawn as raw, unstyled
+    //! bytes. At commit (a `\n`, or `finish()` at EOF) the renderer used to
+    //! ALWAYS erase that row with `\r\x1b[K` and re-emit the styled render —
+    //! even for plain prose, where the styled render is byte-identical to
+    //! what is already on screen. A bare terminal hides the redundant
+    //! reprint via the in-place erase, but a host that pins its own live
+    //! area below the stream (an inline-redraw compositor) cannot tell the
+    //! `\r\x1b[K` cancelled the first copy and renders the line twice. It
+    //! bit reasoning models whose final content block has no trailing
+    //! newline, so `finish()` triggers the commit.
+    //!
+    //! The fix: when the styled render (minus trailing `\n`) equals the raw
+    //! bytes already on screen, emit a bare `\n` and skip the erase+reprint.
+    //! Lines that actually change under styling still take the reprint path.
+
+    use super::*;
+
+    fn out_string(r: &mut StreamingMarkdownRenderer, input: &str) -> String {
+        let mut out = Vec::<u8>::new();
+        // Stream the whole input as one chunk, then EOF-commit.
+        r.write_chunk(input, &mut out).unwrap();
+        r.finish(&mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn plain_prose_eof_commit_emits_no_erase_and_no_duplicate() {
+        // The exact shape of the reported bug: a short greeting with no
+        // trailing newline, committed by finish() at EOF.
+        let mut r = StreamingMarkdownRenderer::new(0, false, true);
+        r.set_term_width_override_for_tests(80);
+        let s = out_string(&mut r, "Hey! What can I help you with?");
+
+        assert!(
+            !s.contains("\r\x1b[K"),
+            "no in-place erase for an unchanged plain line; got {s:?}"
+        );
+        assert_eq!(
+            s.matches("Hey! What can I help you with?").count(),
+            1,
+            "greeting must appear exactly once; got {s:?}"
+        );
+        // The line is terminated so the next output starts on its own row.
+        assert!(
+            s.ends_with('\n'),
+            "committed line ends with a newline: {s:?}"
+        );
+    }
+
+    #[test]
+    fn plain_prose_newline_commit_emits_no_erase() {
+        // Same content, but the producer ends with `\n`. The newline path
+        // must also skip the erase+reprint (parts[0] is empty → the drawn
+        // row already equals the whole committed line).
+        let mut r = StreamingMarkdownRenderer::new(0, false, true);
+        r.set_term_width_override_for_tests(80);
+        let mut out = Vec::<u8>::new();
+        r.write_chunk("Hey! What can I help you with?", &mut out)
+            .unwrap();
+        r.write_chunk("\n", &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+
+        assert!(
+            !s.contains("\r\x1b[K"),
+            "no in-place erase for an unchanged plain line on newline commit; got {s:?}"
+        );
+        assert_eq!(s.matches("Hey! What can I help you with?").count(), 1);
+    }
+
+    #[test]
+    fn styled_line_still_reprints_on_commit() {
+        // A line that changes under styling (bold markup) MUST take the
+        // erase+reprint path: the raw `**world**` on screen has to be
+        // replaced with the styled render.
+        let mut r = StreamingMarkdownRenderer::new(0, false, true);
+        r.set_term_width_override_for_tests(80);
+        let s = out_string(&mut r, "hello **world** now");
+
+        assert!(
+            s.contains("\r\x1b[K"),
+            "a line that restyles must erase the raw partial first; got {s:?}"
+        );
+        // Everything after the erase is the canonical styled render: bold SGR
+        // present, and the raw `**world**` markup replaced. (The raw markup
+        // legitimately appears BEFORE the `\r\x1b[K` — that's the preview row
+        // the erase cancels — so only the post-erase segment is asserted.)
+        let after_erase = s.rsplit("\r\x1b[K").next().unwrap();
+        assert!(after_erase.contains(BOLD), "bold styling applied: {s:?}");
+        assert!(
+            !after_erase.contains("**world**"),
+            "raw markup replaced by styled render after erase: {s:?}"
+        );
+    }
+
+    #[test]
+    fn leading_space_stripped_line_still_reprints() {
+        // A paragraph with 1-3 leading spaces is stripped on render, so the
+        // styled output differs from the raw drawn bytes → must reprint.
+        let mut r = StreamingMarkdownRenderer::new(0, false, true);
+        r.set_term_width_override_for_tests(80);
+        let s = out_string(&mut r, "   indented prose");
+        assert!(
+            s.contains("\r\x1b[K"),
+            "leading-space strip changes the line → reprint required; got {s:?}"
+        );
+    }
+
+    #[test]
+    fn overflowed_partial_still_reprints_full_paragraph() {
+        // When the partial outgrew the row (tail-window latched), the drawn
+        // row is only a preview, never the whole line, so the fast path must
+        // NOT engage: finish() has to erase and render the full paragraph.
+        let mut r = StreamingMarkdownRenderer::new(0, false, true);
+        r.set_term_width_override_for_tests(20);
+        let long: String = "z".repeat(60);
+        let mut out = Vec::<u8>::new();
+        r.write_chunk(&long, &mut out).unwrap();
+        assert!(r.partial_overflowed_for_tests());
+        out.clear();
+        r.finish(&mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        let visible = s.replace("\r\x1b[K", "").replace('\r', "");
+        let visible = ansi_re().replace_all(&visible, "");
+        assert!(
+            visible.contains(&"z".repeat(60)),
+            "full 60-char paragraph rendered on finish; got {visible:?}"
+        );
+    }
+
+    #[test]
+    fn multiline_chunk_with_trailing_bytes_reprints_first_line() {
+        // "abc\ndef": the drawn row is `abc`, but the committed first line is
+        // also `abc` (parts[0] == "" only when the chunk STARTS with \n).
+        // Here parts[0] is "" is false — wait, split('\n') of "abc\ndef" is
+        // ["abc","def"], first_complete = partial("")+"abc". The drawn row is
+        // empty (nothing streamed yet) so drawn_matches_source is false and
+        // it reprints. This pins that a fresh chunk containing a newline does
+        // not spuriously take the skip path.
+        let mut r = StreamingMarkdownRenderer::new(0, false, true);
+        r.set_term_width_override_for_tests(80);
+        let mut out = Vec::<u8>::new();
+        r.write_chunk("abc\ndef", &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("abc"));
+        assert_eq!(r.partial, "def");
     }
 }
 
