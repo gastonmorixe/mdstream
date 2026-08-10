@@ -146,4 +146,31 @@ mod tests {
             assert_eq!(ansi.ends_with('\n'), code.ends_with('\n'));
         }
     }
+
+    #[test]
+    fn diff_lines_use_distinct_theme_colors() {
+        // Regression: ` ```diff ` fences were lexed by syntect's Diff grammar
+        // but rendered monochrome under the default mdstream theme, because the
+        // theme mapped no diff scopes. Each line kind must get its own color.
+        let highlighter = RawCodeHighlighter::new(CodeTheme::Mdstream, false);
+        let code = "@@ -1,3 +1,3 @@\n-old line\n+new line\n context\n";
+        let ansi = highlighter.highlight("diff", code).unwrap();
+
+        let range_gray = "\x1b[38;2;113;123;148m"; // meta.diff.range -> comment
+        let deleted_red = "\x1b[38;2;255;93;122m"; // markup.deleted.diff
+        let inserted_green = "\x1b[38;2;120;227;140m"; // markup.inserted.diff -> string
+
+        let lines: Vec<&str> = ansi.split('\n').collect();
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].contains(range_gray), "@@ hunk header not gray: {}", lines[0]);
+        assert!(lines[1].contains(deleted_red), "deleted line not red: {}", lines[1]);
+        assert!(lines[2].contains(inserted_green), "inserted line not green: {}", lines[2]);
+        assert!(
+            !lines[3].contains(deleted_red)
+                && !lines[3].contains(inserted_green)
+                && !lines[3].contains(range_gray),
+            "context line must stay base-colored: {}",
+            lines[3]
+        );
+    }
 }

@@ -305,6 +305,18 @@ fn mdstream_theme() -> Theme {
                 "support.constant, support.variable, support.other.constant",
                 constant,
             ),
+            // Diff scopes (syntect Diff grammar, ` ```diff ` fences). Colors are
+            // chosen to match the existing palette: inserted green (string),
+            // deleted red (same as invalid), changed yellow (preprocessor),
+            // file headers blue (function), hunk ranges gray (comment).
+            style("markup.inserted.diff", string),
+            style("markup.deleted.diff", rgb(255, 93, 122)),
+            style("markup.changed.diff", preprocessor),
+            style(
+                "meta.diff.header.from-file, meta.diff.header.to-file, punctuation.definition.from-file.diff, punctuation.definition.to-file.diff",
+                function,
+            ),
+            style("meta.diff.range, punctuation.definition.range.diff", comment),
             style("markup.bold", number),
             style("markup.italic", keyword),
             style("markup.quote, markup.raw.inline", function),
