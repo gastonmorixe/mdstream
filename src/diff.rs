@@ -157,13 +157,17 @@ pub fn highlight_unified_diff(
                 let escaped = stream.highlight_line(body)?;
                 match style {
                     DiffStyle::MarkerFg => {
-                        format!("{marker_fg}{marker}{RESET}{escaped}")
+                        // Trailing RESET: escaped ends on a fg escape; without
+                        // it the color would leak past the newline.
+                        format!("{marker_fg}{marker}{RESET}{escaped}{RESET}")
                     }
                     DiffStyle::BgWash => {
                         let wash = if is_added { &inserted_bg } else { &deleted_bg };
                         let escaped = reassert_wash(&escaped, &Some(wash.clone()));
                         // Marker painted on the wash, content on wash + token fg.
-                        format!("{marker_fg}{marker}{RESET}{escaped}")
+                        // Trailing RESET clears both so the wash never leaks
+                        // past the newline into the next host row.
+                        format!("{marker_fg}{marker}{RESET}{escaped}{RESET}")
                     }
                 }
             }
@@ -428,5 +432,52 @@ mod tests {
         .unwrap();
         assert_eq!(strip_ansi(&ansi), code);
         assert_eq!(strip_ansi(&ansi).matches("@@ ").count(), 2);
+    }
+
+    /// Every non-empty output line must end with an ANSI reset before its line
+    /// ending (and at EOF), so no SGR leaks past a newline into the host's
+    /// next row. Covers both styles and the no-trailing-newline case.
+    #[test]
+    fn every_line_ends_balanced_reset() {
+        for style in [DiffStyle::MarkerFg, DiffStyle::BgWash] {
+            for code in [
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-old\n+new", // no trailing \n
+            ] {
+                let ansi = highlight_unified_diff(
+                    "rust",
+                    code,
+                    style,
+                    &default_colors(),
+                    CodeTheme::Mdstream,
+                    false,
+                )
+                .unwrap();
+                let has_trailing = code.ends_with('\n');
+                let lines: Vec<&str> = ansi.split('\n').collect();
+                let body: Vec<&str> = if has_trailing {
+                    &lines[..lines.len() - 1]
+                } else {
+                    &lines[..]
+                }
+                .to_vec();
+                for (i, l) in body.iter().enumerate() {
+                    // Plain (structural/context) lines carry no ANSI and need
+                    // no reset. Styled lines must end reset before the newline.
+                    if !l.is_empty() && l.contains("\x1b[") {
+                        assert!(
+                            l.ends_with("\x1b[0m"),
+                            "style={style:?} line {i} must end reset: {:?}",
+                            l
+                        );
+                    }
+                }
+                assert!(
+                    ansi.ends_with('\n') || ansi.ends_with("\x1b[0m"),
+                    "style={style:?} output must end reset at EOF: {:?}",
+                    ansi
+                );
+            }
+        }
     }
 }

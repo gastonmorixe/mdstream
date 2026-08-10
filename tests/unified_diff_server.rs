@@ -132,6 +132,57 @@ fn assert_error(response: &Value, id: u64) {
     );
 }
 
+/// Changed (+/-) body lines must not leak SGR into the host gutter.
+///
+/// For each non-empty logical line whose plain text starts with `+` or `-`
+/// (excluding structural `---` / `+++` headers), the ANSI body (before the
+/// line ending) must end with `\x1b[0m`. Final lines without a trailing
+/// newline must still end with reset. `strip_ansi` remains byte-identical
+/// to the request `code` (caller asserts that separately).
+fn assert_changed_lines_end_with_reset(ansi: &str) {
+    const RESET: &str = "\x1b[0m";
+    // Walk logical lines preserving endings via split_inclusive-equivalent.
+    let mut rest = ansi;
+    while !rest.is_empty() {
+        let (line_with_ending, next) = if let Some(i) = rest.find('\n') {
+            (&rest[..=i], &rest[i + 1..])
+        } else {
+            (rest, "")
+        };
+        rest = next;
+
+        let ending_len = if line_with_ending.ends_with("\r\n") {
+            2
+        } else if line_with_ending.ends_with('\n') {
+            1
+        } else {
+            0
+        };
+        let body = &line_with_ending[..line_with_ending.len() - ending_len];
+        let plain = strip_ansi(body);
+        if plain.is_empty() {
+            continue;
+        }
+        // Structural headers --- / +++ are context, not changed body.
+        let is_changed = (plain.starts_with('+') && !plain.starts_with("+++"))
+            || (plain.starts_with('-') && !plain.starts_with("---"));
+        if !is_changed {
+            continue;
+        }
+        assert!(
+            body.ends_with(RESET),
+            "changed line must end with \\x1b[0m before line ending/EOF (leaks into host gutter).\nplain={plain:?}\nbody_tail={:?}",
+            body.chars()
+                .rev()
+                .take(40)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        );
+    }
+}
+
 /// READY advertises protocol 2 and the three modes.
 #[test]
 fn ready_advertises_protocol2_and_unified_diff_mode() {
@@ -338,6 +389,7 @@ fn unified_diff_bg_wash_style_if_exposed() {
 
     let ansi = assert_ok_ansi(&response, 6);
     assert_eq!(strip_ansi(ansi), code);
+    assert_changed_lines_end_with_reset(ansi);
 
     let del_line = ansi
         .lines()
@@ -403,6 +455,7 @@ fn unified_diff_bg_wash_default_palette_emits_48_and_token_fg() {
     }));
     let ansi = assert_ok_ansi(&response, 17);
     assert_eq!(strip_ansi(ansi), code);
+    assert_changed_lines_end_with_reset(ansi);
 
     let del_line = ansi
         .lines()
@@ -442,6 +495,49 @@ fn unified_diff_bg_wash_default_palette_emits_48_and_token_fg() {
             || add_line.matches("\u{1b}[38;2;").count() >= 2,
         "default wash must not strip content fg: {add_line:?}"
     );
+}
+
+/// Dedicated gate: bg-wash changed lines end with \\x1b[0m before \\n and at EOF.
+#[test]
+fn unified_diff_bg_wash_changed_lines_end_with_reset() {
+    let mut server = Server::start(&[]);
+    assert_ready_v2(&server.read());
+
+    // Includes trailing-newline and no-trailing-newline cases.
+    for (id, code) in [
+        (18u64, "--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-old\n+new\n"),
+        (19u64, "--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-old\n+new"),
+    ] {
+        let response = server.request(json!({
+            "id": id,
+            "mode": "unified-diff",
+            "language": "rust",
+            "code": code,
+            "diffStyle": "bg-wash",
+        }));
+        let ansi = assert_ok_ansi(&response, id);
+        assert_eq!(strip_ansi(ansi), code);
+        assert_changed_lines_end_with_reset(ansi);
+    }
+}
+
+/// marker-fg path must also balance SGR on changed lines (same leak class).
+#[test]
+fn unified_diff_marker_fg_changed_lines_end_with_reset() {
+    let mut server = Server::start(&[]);
+    assert_ready_v2(&server.read());
+
+    let code = "--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-old\n+new\n";
+    let response = server.request(json!({
+        "id": 20,
+        "mode": "unified-diff",
+        "language": "rust",
+        "code": code,
+        "diffStyle": "marker-fg",
+    }));
+    let ansi = assert_ok_ansi(&response, 20);
+    assert_eq!(strip_ansi(ansi), code);
+    assert_changed_lines_end_with_reset(ansi);
 }
 
 /// Unknown mode fails closed with error JSON (agent can fall back).
