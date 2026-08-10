@@ -7,8 +7,9 @@ use crate::highlight::{RawCodeHighlighter, bg_escape};
 use crate::theme::CodeTheme;
 
 /// Supported request modes, advertised in the ready line so a client never
-/// wastes a sacrificial request probing capability.
-pub const MODES: &[&str] = &["raw", "diff-wash", "unified-diff"];
+/// wastes a sacrificial request probing capability. Only modes with a live
+/// handler are advertised; unified-diff is added once Phase 2 lands.
+pub const MODES: &[&str] = &["raw", "diff-wash"];
 
 #[derive(Debug, Deserialize)]
 struct HighlightRequest {
@@ -246,10 +247,8 @@ mod tests {
         let lines = run_once(b"");
         assert_eq!(lines[0]["ready"], 1);
         assert_eq!(lines[0]["protocol"], 2);
-        assert_eq!(
-            lines[0]["modes"],
-            serde_json::json!(["raw", "diff-wash", "unified-diff"])
-        );
+        // Only implemented modes are advertised; unified-diff joins once live.
+        assert_eq!(lines[0]["modes"], serde_json::json!(["raw", "diff-wash"]));
     }
 
     #[test]
