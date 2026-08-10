@@ -9,6 +9,44 @@ use crate::theme::{CodeTheme, load_theme_set};
 
 const RESET: &str = "\x1b[0m";
 
+/// The ANSI escape emitted to set an 8-bit background color (e.g. `#ff5d7a`).
+pub(crate) fn bg_escape(hex: &str) -> Option<String> {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(format!("\x1b[48;2;{r};{g};{b}m"))
+}
+
+/// Re-asserts a per-line background after every `\x1b[0m` reset in `escaped`.
+///
+/// `as_24_bit_terminal_escaped` styles each span and appends a trailing
+/// `\x1b[0m` which clears foreground AND background together. To paint a
+/// per-line wash while keeping token foreground colors, the wash must be
+/// re-asserted after every reset syntect emits. Returns the escaped text with
+/// the wash re-asserted, or the input unchanged when `wash` is `None`.
+pub(crate) fn reassert_wash(escaped: &str, wash: &Option<String>) -> String {
+    let Some(wash) = wash else {
+        return escaped.to_owned();
+    };
+    if !escaped.contains(RESET) {
+        return format!("{wash}{escaped}");
+    }
+    let mut out = String::with_capacity(escaped.len() + wash.len() * 4);
+    out.push_str(wash);
+    let mut rest = escaped;
+    while let Some(idx) = rest.find(RESET) {
+        out.push_str(&rest[..idx + RESET.len()]);
+        out.push_str(wash);
+        rest = &rest[idx + RESET.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 pub(crate) struct SyntectAssets {
     pub(crate) syntax_set: SyntaxSet,
     theme_set: ThemeSet,
@@ -85,6 +123,24 @@ impl RawCodeHighlighter {
     /// non-empty logical output line ends with an ANSI reset before its line
     /// ending, so terminal styling cannot leak into later output.
     pub fn highlight(&self, language: &str, code: &str) -> Result<String, syntect::Error> {
+        self.highlight_with_washes(language, code, None)
+    }
+
+    /// Like [`Self::highlight`], but paints an optional per-line background
+    /// wash on each logical line.
+    ///
+    /// `washes` must have exactly one entry per logical line of `code` (split
+    /// preserving `\r\n` and the trailing-newline shape): `None` for no wash on
+    /// that line, `Some(hex)` for a `#rrggbb` background. The wash is re-asserted
+    /// after every `\x1b[0m` reset within the line and cleared before the line
+    /// ending, so it never leaks across lines. Pass `None` for `washes` to get
+    /// byte-identical output to [`Self::highlight`].
+    pub fn highlight_with_washes(
+        &self,
+        language: &str,
+        code: &str,
+        washes: Option<&[Option<String>]>,
+    ) -> Result<String, syntect::Error> {
         if code.is_empty() {
             return Ok(String::new());
         }
@@ -92,6 +148,7 @@ impl RawCodeHighlighter {
         let assets = syntect_assets();
         let mut highlighter = make_highlighter(language, self.code_theme);
         let mut output = String::with_capacity(code.len());
+        let mut line_idx = 0usize;
 
         for line in code.split_inclusive('\n') {
             let (content, ending) = if let Some(content) = line.strip_suffix("\r\n") {
@@ -107,9 +164,12 @@ impl RawCodeHighlighter {
             parse_line.push('\n');
             let regions = highlighter.highlight_line(&parse_line, &assets.syntax_set)?;
             let escaped = as_24_bit_terminal_escaped(&regions, self.show_background);
-            output.push_str(escaped.trim_end_matches('\n'));
+            let wash = washes.and_then(|w| w.get(line_idx)).and_then(|w| w.clone());
+            let escaped = reassert_wash(&escaped.trim_end_matches('\n'), &wash);
+            output.push_str(&escaped);
             output.push_str(RESET);
             output.push_str(ending);
+            line_idx += 1;
         }
 
         Ok(output)
@@ -162,9 +222,21 @@ mod tests {
 
         let lines: Vec<&str> = ansi.split('\n').collect();
         assert_eq!(lines.len(), 5);
-        assert!(lines[0].contains(range_gray), "@@ hunk header not gray: {}", lines[0]);
-        assert!(lines[1].contains(deleted_red), "deleted line not red: {}", lines[1]);
-        assert!(lines[2].contains(inserted_green), "inserted line not green: {}", lines[2]);
+        assert!(
+            lines[0].contains(range_gray),
+            "@@ hunk header not gray: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(deleted_red),
+            "deleted line not red: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains(inserted_green),
+            "inserted line not green: {}",
+            lines[2]
+        );
         assert!(
             !lines[3].contains(deleted_red)
                 && !lines[3].contains(inserted_green)
@@ -172,5 +244,93 @@ mod tests {
             "context line must stay base-colored: {}",
             lines[3]
         );
+    }
+
+    #[test]
+    fn highlight_with_washes_is_byte_identical_when_all_none() {
+        let highlighter = RawCodeHighlighter::new(CodeTheme::Mdstream, false);
+        for code in [
+            "const x = 1;",
+            "const x = 1;\n",
+            "a\n\n",
+            "a\r\nb\r\n",
+            "/* c\nstill c */\nlet y: number = 2;",
+        ] {
+            let plain = highlighter.highlight("typescript", code).unwrap();
+            let washes: Vec<Option<String>> = code.lines().map(|_| None).collect();
+            let washed = highlighter
+                .highlight_with_washes("typescript", code, Some(&washes))
+                .unwrap();
+            assert_eq!(washed, plain, "code: {:?}", code);
+        }
+    }
+
+    #[test]
+    fn wash_reasserts_after_each_reset_and_clears_at_line_end() {
+        // Directly exercise the re-assert primitive with a hand-built string
+        // containing an internal reset (the case that would otherwise clear
+        // the wash mid-line).
+        let wash = Some("\x1b[48;2;255;93;122m".to_string());
+        let escaped = "\x1b[38;2;123;167;255mlet\x1b[0m rest";
+        let reasserted = reassert_wash(escaped, &wash);
+        // Wash leads, is re-asserted after the internal reset.
+        assert!(reasserted.starts_with("\x1b[48;2;255;93;122m"));
+        assert!(reasserted.contains("\x1b[0m\x1b[48;2;255;93;122m rest"));
+        assert_eq!(reasserted.matches("\x1b[48;2;255;93;122m").count(), 2);
+
+        // Through the public API: a washed line leads with wash and ends
+        // reset (the caller's trailing RESET clears it, so it never leaks
+        // past the newline); an unwashed sibling line is wash-free.
+        let highlighter = RawCodeHighlighter::new(CodeTheme::Mdstream, false);
+        let code = "let s: string = \"hi\"; // trailing\nnext";
+        let wash = "\x1b[48;2;255;93;122m".to_string();
+        let washes = vec![Some(wash.clone()), None];
+        let ansi = highlighter
+            .highlight_with_washes("typescript", code, Some(&washes))
+            .unwrap();
+        let lines: Vec<&str> = ansi.split('\n').collect();
+        assert!(
+            lines[0].starts_with(&wash),
+            "line must open with wash: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[0].ends_with("\x1b[0m"),
+            "line must end reset: {:?}",
+            lines[0]
+        );
+        assert!(
+            !lines[1].contains(&wash),
+            "second line must be wash-free: {:?}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn wash_preserves_trailing_newline_shape() {
+        let highlighter = RawCodeHighlighter::new(CodeTheme::Mdstream, false);
+        let wash = "\x1b[48;2;0;255;0m".to_string();
+        for code in ["a\n", "a", "a\r\nb\r\n", "a\n\n"] {
+            let count = if code.ends_with('\n') {
+                code.lines().count()
+            } else {
+                1
+            };
+            let washes: Vec<Option<String>> = (0..count).map(|_| Some(wash.clone())).collect();
+            let ansi = highlighter
+                .highlight_with_washes("plaintext", code, Some(&washes))
+                .unwrap();
+            assert_eq!(
+                ansi.ends_with('\n'),
+                code.ends_with('\n'),
+                "code: {:?}",
+                code
+            );
+            assert!(
+                !ansi.ends_with(&wash),
+                "wash must not leak past final newline: {:?}",
+                ansi
+            );
+        }
     }
 }
