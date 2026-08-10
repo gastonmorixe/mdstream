@@ -1,5 +1,7 @@
 pub mod cli;
 pub mod help;
+pub mod highlight;
+pub mod highlight_server;
 pub mod renderer;
 pub mod theme;
 
@@ -23,10 +25,6 @@ impl std::fmt::Display for StdinIsTerminal {
 impl std::error::Error for StdinIsTerminal {}
 
 pub fn run(cli: cli::Cli) -> Result<()> {
-    let is_tty = io::stdin().is_terminal();
-    let mut stderr = io::stderr().lock();
-    handle_tty_check(is_tty, &mut stderr)?;
-
     let show_code_background = if cli.code_background {
         true
     } else if cli.no_code_background {
@@ -34,6 +32,21 @@ pub fn run(cli: cli::Cli) -> Result<()> {
     } else {
         DEFAULT_SHOW_CODE_BACKGROUND
     };
+
+    if cli.highlight_server {
+        let stdin = io::stdin();
+        let stdout = io::stdout();
+        return highlight_server::run_highlight_server(
+            stdin.lock(),
+            stdout.lock(),
+            cli.theme,
+            show_code_background,
+        );
+    }
+
+    let is_tty = io::stdin().is_terminal();
+    let mut stderr = io::stderr().lock();
+    handle_tty_check(is_tty, &mut stderr)?;
 
     let mut renderer = renderer::StreamingMarkdownRenderer::with_code_theme_and_inline_code_color(
         cli.padding,

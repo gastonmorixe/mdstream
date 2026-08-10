@@ -1,6 +1,7 @@
+use crate::highlight::{make_highlighter, syntect_assets};
 use crate::theme::{
     CodeTheme, DEFAULT_CODE_THEME, DEFAULT_INLINE_CODE_COLOR, DEFAULT_SHOW_CODE_BACKGROUND,
-    PaletteColor, load_theme_set,
+    PaletteColor,
 };
 use anyhow::Result;
 use crossterm::terminal;
@@ -8,8 +9,6 @@ use regex::Regex;
 use std::io::{IsTerminal, Read, Write};
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
 use syntect::util::as_24_bit_terminal_escaped;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -224,49 +223,11 @@ fn table_separator_cell_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^:?-+:?$").unwrap())
 }
 
-struct SyntectAssets {
-    syntax_set: SyntaxSet,
-    theme_set: ThemeSet,
-}
-
-impl SyntectAssets {
-    fn load() -> Self {
-        Self {
-            syntax_set: SyntaxSet::load_defaults_newlines(),
-            theme_set: load_theme_set(),
-        }
-    }
-
-    fn theme(&self, code_theme: CodeTheme) -> &Theme {
-        self.theme_set
-            .themes
-            .get(code_theme.theme_key())
-            .or_else(|| self.theme_set.themes.values().next())
-            .expect("syntect default themes should not be empty")
-    }
-}
-
-fn syntect_assets() -> &'static SyntectAssets {
-    static ASSETS: OnceLock<SyntectAssets> = OnceLock::new();
-    ASSETS.get_or_init(SyntectAssets::load)
-}
-
 fn lang_color(lang: &str) -> &'static str {
     LANG_COLORS
         .iter()
         .find_map(|(candidate, color)| (*candidate == lang).then_some(*color))
         .unwrap_or(LANG_COLOR_DEFAULT)
-}
-
-fn normalize_syntax_token(lang: &str) -> &str {
-    if matches!(
-        lang.trim().to_ascii_lowercase().as_str(),
-        "typescript" | "ts" | "mts" | "cts" | "tsx"
-    ) {
-        "javascript"
-    } else {
-        lang
-    }
 }
 
 fn split_blockquote(line: &str) -> (usize, &str) {
@@ -1993,12 +1954,7 @@ impl StreamingMarkdownRenderer {
     }
 
     fn make_code_highlighter(lang: &str, code_theme: CodeTheme) -> HighlightLines<'static> {
-        let assets = syntect_assets();
-        let syntax = assets
-            .syntax_set
-            .find_syntax_by_token(normalize_syntax_token(lang))
-            .unwrap_or_else(|| assets.syntax_set.find_syntax_plain_text());
-        HighlightLines::new(syntax, assets.theme(code_theme))
+        make_highlighter(lang, code_theme)
     }
 
     fn render_code_line(&mut self, stripped: &str) -> String {

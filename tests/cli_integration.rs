@@ -111,6 +111,7 @@ fn help_lists_theme_flag_and_values() {
     assert!(stdout.contains("--code-background"));
     assert!(stdout.contains("solarized-dark"));
     assert!(stdout.contains("--no-code-background"));
+    assert!(!stdout.contains("--highlight-server"));
     assert!(stdout.contains("License: MIT"));
     assert!(stdout.contains("Creator: Gaston Morixe <gaston@gastonmorixe.com>"));
     assert!(stdout.contains("Repository: https://github.com/gastonmorixe/mdstream"));
@@ -211,7 +212,7 @@ fn help_screen_lists_every_clap_flag_and_env() {
     let mut missing_envs: Vec<String> = Vec::new();
     for arg in cmd.get_arguments() {
         if let Some(long) = arg.get_long() {
-            if matches!(long, "help" | "version") {
+            if matches!(long, "help" | "version") || arg.is_hide_set() {
                 continue;
             }
             let needle = format!("--{long}");

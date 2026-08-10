@@ -137,9 +137,9 @@ fn flags_markdown() -> String {
 
     for arg in cmd.get_arguments() {
         let Some(long) = arg.get_long() else { continue };
-        if matches!(long, "help" | "version") {
-            // clap auto-injects these — handled in the static
-            // `Common` section above.
+        if matches!(long, "help" | "version") || arg.is_hide_set() {
+            // clap auto-injected and intentionally hidden flags do not belong
+            // on the public help screen.
             continue;
         }
         let line = render_flag_line(arg, long);
@@ -307,7 +307,7 @@ mod tests {
         let cmd = Cli::command();
         for arg in cmd.get_arguments() {
             if let Some(long) = arg.get_long() {
-                if matches!(long, "help" | "version") {
+                if matches!(long, "help" | "version") || arg.is_hide_set() {
                     continue;
                 }
                 let needle = format!("--{long}");

@@ -9,6 +9,9 @@ use crate::theme::{CodeTheme, DEFAULT_CODE_THEME, DEFAULT_INLINE_CODE_COLOR, Pal
     about = "Streaming Markdown renderer for terminals"
 )]
 pub struct Cli {
+    #[arg(long, hide = true, default_value_t = false)]
+    pub highlight_server: bool,
+
     #[arg(
         long,
         env = "MDSTREAM_PADDING",
