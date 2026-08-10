@@ -112,11 +112,12 @@ pub fn highlight_unified_diff(
         .ok_or_else(|| anyhow::anyhow!("invalid inserted color: {}", inserted_hex))?;
     let deleted_fg = fg_escape(&deleted_hex)
         .ok_or_else(|| anyhow::anyhow!("invalid deleted color: {}", deleted_hex))?;
-    // Background wash uses the same hex verbatim (the caller is expected to pass
-    // palette-derived dark tints for bg-wash; do not re-darken). Invalid hex was
-    // already rejected by the fg_escape checks above, so these are safe.
-    let inserted_bg = bg_escape(&inserted_hex).unwrap();
-    let deleted_bg = bg_escape(&deleted_hex).unwrap();
+    // The background wash is derived: blend the semantic color ~22% toward
+    // black so the full-payload wash is obvious but not loud, while the marker
+    // keeps its bright color and syntax foreground stays readable. The agent
+    // sends bright semantic hex; the server owns wash strength.
+    let inserted_bg = bg_escape(&wash_tint(&inserted_hex, 0.22)).unwrap();
+    let deleted_bg = bg_escape(&wash_tint(&deleted_hex, 0.22)).unwrap();
 
     let mut output = String::with_capacity(code.len() * 2);
     let mut pending_no_newline: Option<(String, String)> = None;
@@ -183,6 +184,18 @@ pub fn highlight_unified_diff(
     }
 
     Ok(output)
+}
+
+/// Blends a `#rrggbb` hex color toward black by `factor` (0..=1), producing a
+/// soft wash background derived from the marker color.
+fn wash_tint(hex: &str, factor: f64) -> String {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0) as f64;
+    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0) as f64;
+    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0) as f64;
+    let f = factor.clamp(0.0, 1.0);
+    let tint = |c: f64| (c * f) as u8;
+    format!("#{:02x}{:02x}{:02x}", tint(r), tint(g), tint(b))
 }
 
 /// Splits a split_inclusive line into (content, ending).
