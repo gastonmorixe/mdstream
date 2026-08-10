@@ -4,6 +4,17 @@ All notable changes to `mdstream` are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- A new hidden `--highlight-server` flag runs `mdstream` as a raw-code highlighting service instead of the streaming Markdown renderer. It speaks a line-delimited JSON protocol over stdin/stdout: once syntect's syntax and theme assets finish loading it writes `{"ready":1}`, then for each input line `{"id":N,"language":"...","code":"..."}` it writes exactly one `{"id":N,"ansi":"..."}` response line (or `{"id":N,"error":"..."}` when the request is malformed or highlighting fails). The `ansi` payload carries the code highlighted with no Markdown framing, line numbers, indentation, or padding, so a host process (editor plugin, chat frontend, terminal wrapper) can reuse `mdstream`'s bundled themes and syntect syntaxes without reimplementing highlighting. Requests are handled sequentially; lexical state is fresh per request but retained across lines within it. Input line endings and trailing-newline shape are preserved verbatim, and every non-empty output line ends with an ANSI reset so styling cannot leak into later output. Integration tests in `tests/highlight_server.rs` drive the real binary over pipes: the ready handshake, TypeScript highlighting, unknown-language plaintext fallback, JSON escaping round-trips, and multiline lexical state. The flag is `#[arg(hide = true)]`, so it appears in neither `--help` nor the guard tests.
+- New public `highlight::RawCodeHighlighter` API — `RawCodeHighlighter::new(code_theme, show_background)` / `.highlight(language, code)` — exposing the same raw-code highlighting the server uses, for embedding `mdstream` as a library. Unit tests cover multiline lexical state and trailing-newline shape preservation.
+
+### Changed
+
+- Syntect syntax/theme assets, the TypeScript→JavaScript syntax-token normalization, and the highlighter constructor moved out of `renderer.rs` into the new `highlight` module, still shared process-wide behind a single `OnceLock`. The streaming renderer now delegates through `highlight::make_highlighter`; rendering behavior is unchanged.
+- The programmatically generated `--help` flags section and its guard test now skip clap args with `hide = true` set, so internal flags like `--highlight-server` stay off the public help screen while remaining functional.
+- New dependencies: `serde` (with `derive`) and `serde_json`, used by the highlight-server JSON protocol.
+
 ### Fixed
 
 - A committed line that is byte-identical to the raw partial already drawn on screen (plain prose with no inline markup) no longer emits a redundant `\r\x1b[K` erase followed by an identical reprint. Previously every line commit — a `\n`, or `finish()` at EOF — unconditionally erased the live partial row and re-emitted the styled render, even when styling changed nothing. On a bare terminal the in-place `\r\x1b[K` hid the duplicate, but a host that pins its own live area below the stream and tracks the cursor itself (an inline-redraw compositor) had no way to know the erase cancelled the first copy, so the line rendered **twice** in scrollback. This bit reasoning models whose final assistant content block carries no trailing newline (the commit is triggered by `finish()` rather than a `\n`), surfacing as a duplicated response. Lines that actually change under styling (bold, code spans, links, headings, list markers, leading-space stripping, tables, and any overflowed/tail-windowed partial) still take the erase + reprint path unchanged. Regression tests in `renderer::duplicate_line_commit_tests`.
