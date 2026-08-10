@@ -98,7 +98,7 @@ fn assert_ready_v2(ready: &Value) {
     let modes: Vec<&str> = modes.iter().filter_map(|m| m.as_str()).collect();
     for required in ["raw", "diff-wash", "unified-diff"] {
         assert!(
-            modes.iter().any(|m| *m == required),
+            modes.contains(&required),
             "ready.modes must advertise {required}: {modes:?}"
         );
     }
@@ -309,7 +309,7 @@ fn unified_diff_semantic_color_overrides() {
     );
 }
 
-/// `diffStyle: "bg-wash"` (if exposed) re-asserts background after SGR 0.
+/// `diffStyle: "bg-wash"`: marker+payload emit 48;2 wash AND keep token/base fg.
 #[test]
 fn unified_diff_bg_wash_style_if_exposed() {
     let mut server = Server::start(&[]);
@@ -322,6 +322,8 @@ fn unified_diff_bg_wash_style_if_exposed() {
 -removed
 +added
 ";
+    // Dark wash overrides (agent Edit will pass palette-derived dark tints).
+    // Must remain legible with light token/base fg on top.
     let response = server.request(json!({
         "id": 6,
         "mode": "unified-diff",
@@ -329,21 +331,107 @@ fn unified_diff_bg_wash_style_if_exposed() {
         "code": code,
         "diffStyle": "bg-wash",
         "colors": {
-            "inserted": "#010203",
-            "deleted": "#040506",
+            "inserted": "#1a3d24",
+            "deleted": "#3d1a24",
         },
     }));
 
-    // If bg-wash is not implemented yet, error is acceptable; otherwise require bg SGR.
-    if response.get("error").and_then(|e| e.as_str()).is_some() {
-        assert_error(&response, 6);
-        return;
-    }
     let ansi = assert_ok_ansi(&response, 6);
     assert_eq!(strip_ansi(ansi), code);
+
+    let del_line = ansi
+        .lines()
+        .find(|l| strip_ansi(l).starts_with('-') && strip_ansi(l).contains("removed"))
+        .expect("deleted body line");
+    let add_line = ansi
+        .lines()
+        .find(|l| strip_ansi(l).starts_with('+') && strip_ansi(l).contains("added"))
+        .expect("added body line");
+
+    // Background wash present on marker+payload lines (48;2).
     assert!(
-        ansi.contains("\u{1b}[48;2;") || ansi.contains("\u{1b}[48;"),
-        "bg-wash should emit background SGR: {ansi:?}"
+        del_line.contains("\u{1b}[48;2;61;26;36m"),
+        "deleted line must carry dark red wash #3d1a24: {del_line:?}"
+    );
+    assert!(
+        add_line.contains("\u{1b}[48;2;26;61;36m"),
+        "added line must carry dark green wash #1a3d24: {add_line:?}"
+    );
+    // Marker fg still present (same hex as colors, as 38;2).
+    assert!(
+        del_line.contains("\u{1b}[38;2;61;26;36m"),
+        "deleted marker fg missing: {del_line:?}"
+    );
+    assert!(
+        add_line.contains("\u{1b}[38;2;26;61;36m"),
+        "added marker fg missing: {add_line:?}"
+    );
+    // Payload keeps a non-wash foreground (token or base) — not bg-only monochrome.
+    assert!(
+        del_line.contains("\u{1b}[38;2;232;238;250m") || del_line.matches("\u{1b}[38;2;").count() >= 2,
+        "deleted payload should retain token/base fg under wash: {del_line:?}"
+    );
+    assert!(
+        add_line.contains("\u{1b}[38;2;232;238;250m") || add_line.matches("\u{1b}[38;2;").count() >= 2,
+        "added payload should retain token/base fg under wash: {add_line:?}"
+    );
+}
+
+/// Default palette bg-wash: documents current server defaults (#ff5d7a / #78e38c).
+/// Bright wash + light base fg is a known legibility risk; agent should override
+/// with dark tints (see unified_diff_bg_wash_style_if_exposed).
+#[test]
+fn unified_diff_bg_wash_default_palette_emits_48_and_token_fg() {
+    let mut server = Server::start(&[]);
+    assert_ready_v2(&server.read());
+
+    let code = "\
+--- a/x.rs
++++ b/x.rs
+@@ -1 +1 @@
+-old_line
++new_line
+";
+    let response = server.request(json!({
+        "id": 17,
+        "mode": "unified-diff",
+        "language": "rust",
+        "code": code,
+        "diffStyle": "bg-wash",
+        // no colors → server defaults
+    }));
+    let ansi = assert_ok_ansi(&response, 17);
+    assert_eq!(strip_ansi(ansi), code);
+
+    let del_line = ansi
+        .lines()
+        .find(|l| strip_ansi(l).contains("old_line"))
+        .expect("deleted line");
+    let add_line = ansi
+        .lines()
+        .find(|l| strip_ansi(l).contains("new_line"))
+        .expect("added line");
+
+    // Default deleted #ff5d7a → 255;93;122 ; inserted #78e38c → 120;227;140
+    assert!(
+        del_line.contains("\u{1b}[48;2;255;93;122m"),
+        "default deleted wash: {del_line:?}"
+    );
+    assert!(
+        add_line.contains("\u{1b}[48;2;120;227;140m"),
+        "default inserted wash: {add_line:?}"
+    );
+    // Marker fg uses same default hex.
+    assert!(del_line.contains("\u{1b}[38;2;255;93;122m"));
+    assert!(add_line.contains("\u{1b}[38;2;120;227;140m"));
+    // Content still has a separate fg (base or token) under the wash.
+    assert!(
+        del_line.contains("\u{1b}[38;2;232;238;250m") || del_line.matches("\u{1b}[38;2;").count() >= 2,
+        "default wash must not strip content fg: {del_line:?}"
+    );
+    assert!(
+        add_line.contains("\u{1b}[38;2;232;238;250m") || add_line.matches("\u{1b}[38;2;").count() >= 2,
+        "default wash must not strip content fg: {add_line:?}"
     );
 }
 
