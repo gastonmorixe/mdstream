@@ -316,7 +316,10 @@ fn mdstream_theme() -> Theme {
                 "meta.diff.header.from-file, meta.diff.header.to-file, punctuation.definition.from-file.diff, punctuation.definition.to-file.diff",
                 function,
             ),
-            style("meta.diff.range, punctuation.definition.range.diff", comment),
+            style(
+                "meta.diff.range, punctuation.definition.range.diff",
+                comment,
+            ),
             style("markup.bold", number),
             style("markup.italic", keyword),
             style("markup.quote, markup.raw.inline", function),
