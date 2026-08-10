@@ -322,8 +322,8 @@ fn unified_diff_bg_wash_style_if_exposed() {
 -removed
 +added
 ";
-    // Bright semantic overrides (agent Edit path): server derives soft wash
-    // via wash_tint(hex, 0.22). Marker fg stays full hex; payload keeps token fg.
+    // Bright semantic colors: server uses the same hex for marker fg and wash bg
+    // (identity wash; soft tint is agent/host responsibility if desired).
     let response = server.request(json!({
         "id": 6,
         "mode": "unified-diff",
@@ -348,16 +348,15 @@ fn unified_diff_bg_wash_style_if_exposed() {
         .find(|l| strip_ansi(l).starts_with('+') && strip_ansi(l).contains("added"))
         .expect("added body line");
 
-    // #ff50c8 → wash 48;2;56;17;44 ; #00ff88 → wash 48;2;0;56;29
+    // Marker fg + wash bg both use full colors hex.
     assert!(
-        del_line.contains("\u{1b}[48;2;56;17;44m"),
-        "deleted wash must be wash_tint(#ff50c8,0.22): {del_line:?}"
+        del_line.contains("\u{1b}[48;2;255;80;200m"),
+        "deleted wash must match colors.deleted #ff50c8: {del_line:?}"
     );
     assert!(
-        add_line.contains("\u{1b}[48;2;0;56;29m"),
-        "added wash must be wash_tint(#00ff88,0.22): {add_line:?}"
+        add_line.contains("\u{1b}[48;2;0;255;136m"),
+        "added wash must match colors.inserted #00ff88: {add_line:?}"
     );
-    // Marker fg = full colors hex as 38;2.
     assert!(
         del_line.contains("\u{1b}[38;2;255;80;200m"),
         "deleted marker fg missing: {del_line:?}"
@@ -379,8 +378,8 @@ fn unified_diff_bg_wash_style_if_exposed() {
     );
 }
 
-/// Default palette bg-wash: marker fg = full defaults; bg = wash_tint(hex, 0.22).
-/// Agent should pass bright semantic colors and let the server derive soft wash.
+/// Default palette bg-wash: marker fg and wash bg both use defaults
+/// (#ff5d7a / #78e38c). Soft tint (if any) is host-side; server is identity.
 #[test]
 fn unified_diff_bg_wash_default_palette_emits_48_and_token_fg() {
     let mut server = Server::start(&[]);
@@ -413,25 +412,17 @@ fn unified_diff_bg_wash_default_palette_emits_48_and_token_fg() {
         .find(|l| strip_ansi(l).contains("new_line"))
         .expect("added line");
 
-    // Marker fg: full default hex (#ff5d7a / #78e38c).
+    // Default deleted #ff5d7a → 255;93;122 ; inserted #78e38c → 120;227;140
     assert!(
-        del_line.contains("\u{1b}[38;2;255;93;122m"),
-        "default deleted marker fg: {del_line:?}"
+        del_line.contains("\u{1b}[48;2;255;93;122m"),
+        "default deleted wash: {del_line:?}"
     );
     assert!(
-        add_line.contains("\u{1b}[38;2;120;227;140m"),
-        "default inserted marker fg: {add_line:?}"
+        add_line.contains("\u{1b}[48;2;120;227;140m"),
+        "default inserted wash: {add_line:?}"
     );
-    // Background: wash_tint toward black at 0.22
-    // #ff5d7a → 56;20;26 ; #78e38c → 26;49;30
-    assert!(
-        del_line.contains("\u{1b}[48;2;56;20;26m"),
-        "default deleted wash_tint: {del_line:?}"
-    );
-    assert!(
-        add_line.contains("\u{1b}[48;2;26;49;30m"),
-        "default inserted wash_tint: {add_line:?}"
-    );
+    assert!(del_line.contains("\u{1b}[38;2;255;93;122m"));
+    assert!(add_line.contains("\u{1b}[38;2;120;227;140m"));
     // Content still has a separate fg (base or token) under the wash.
     assert!(
         del_line.contains("\u{1b}[38;2;232;238;250m")
