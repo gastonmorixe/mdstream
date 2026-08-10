@@ -9,6 +9,18 @@ use crate::theme::{CodeTheme, load_theme_set};
 
 const RESET: &str = "\x1b[0m";
 
+/// The ANSI escape emitted to set an 8-bit foreground color (e.g. `#ff5d7a`).
+pub(crate) fn fg_escape(hex: &str) -> Option<String> {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(format!("\x1b[38;2;{r};{g};{b}m"))
+}
+
 /// The ANSI escape emitted to set an 8-bit background color (e.g. `#ff5d7a`).
 pub(crate) fn bg_escape(hex: &str) -> Option<String> {
     let hex = hex.strip_prefix('#').unwrap_or(hex);
@@ -83,6 +95,38 @@ pub(crate) fn make_highlighter(language: &str, code_theme: CodeTheme) -> Highlig
     HighlightLines::new(syntax, assets.theme(code_theme))
 }
 
+/// A persistent per-stream highlighter for dual-stream diff composition.
+///
+/// Each stream (deleted/from, added/to) keeps its own lexical state so an open
+/// comment on the deleted side cannot poison the added side. `highlight_line`
+/// returns the escaped content for one logical line, without the trailing
+/// newline (the caller appends framing and the line ending).
+pub(crate) struct LineHighlighter {
+    highlighter: HighlightLines<'static>,
+    show_background: bool,
+}
+
+impl LineHighlighter {
+    pub(crate) fn new(language: &str, code_theme: CodeTheme, show_background: bool) -> Self {
+        Self {
+            highlighter: make_highlighter(language, code_theme),
+            show_background,
+        }
+    }
+
+    pub(crate) fn highlight_line(&mut self, content: &str) -> Result<String, syntect::Error> {
+        let assets = syntect_assets();
+        let mut parse_line = String::with_capacity(content.len() + 1);
+        parse_line.push_str(content);
+        parse_line.push('\n');
+        let regions = self
+            .highlighter
+            .highlight_line(&parse_line, &assets.syntax_set)?;
+        let escaped = as_24_bit_terminal_escaped(&regions, self.show_background);
+        Ok(escaped.trim_end_matches('\n').to_owned())
+    }
+}
+
 fn normalize_syntax_token(language: &str) -> &str {
     if matches!(
         language.trim().to_ascii_lowercase().as_str(),
@@ -148,9 +192,8 @@ impl RawCodeHighlighter {
         let assets = syntect_assets();
         let mut highlighter = make_highlighter(language, self.code_theme);
         let mut output = String::with_capacity(code.len());
-        let mut line_idx = 0usize;
 
-        for line in code.split_inclusive('\n') {
+        for (line_idx, line) in code.split_inclusive('\n').enumerate() {
             let (content, ending) = if let Some(content) = line.strip_suffix("\r\n") {
                 (content, "\r\n")
             } else if let Some(content) = line.strip_suffix('\n') {
@@ -165,11 +208,10 @@ impl RawCodeHighlighter {
             let regions = highlighter.highlight_line(&parse_line, &assets.syntax_set)?;
             let escaped = as_24_bit_terminal_escaped(&regions, self.show_background);
             let wash = washes.and_then(|w| w.get(line_idx)).and_then(|w| w.clone());
-            let escaped = reassert_wash(&escaped.trim_end_matches('\n'), &wash);
+            let escaped = reassert_wash(escaped.trim_end_matches('\n'), &wash);
             output.push_str(&escaped);
             output.push_str(RESET);
             output.push_str(ending);
-            line_idx += 1;
         }
 
         Ok(output)

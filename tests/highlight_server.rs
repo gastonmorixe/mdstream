@@ -58,13 +58,26 @@ fn strip_ansi(text: &str) -> String {
 #[test]
 fn ready_handshake_precedes_responses() {
     let mut server = Server::start(&[]);
-    assert_eq!(server.read(), json!({ "ready": 1 }));
+    let ready = server.read();
+    assert_eq!(ready["ready"], 1);
+    // Protocol v2 adds protocol/modes additively; v1 clients ignore extras.
+    assert_eq!(ready["protocol"], 2);
+    let modes: Vec<&str> = ready["modes"]
+        .as_array()
+        .expect("modes array")
+        .iter()
+        .filter_map(|m| m.as_str())
+        .collect();
+    for required in ["raw", "diff-wash", "unified-diff"] {
+        assert!(modes.contains(&required), "missing {required}: {modes:?}");
+    }
 }
 
 #[test]
 fn highlights_typescript_without_markdown_frame_or_padding() {
     let mut server = Server::start(&["--padding", "12"]);
-    assert_eq!(server.read(), json!({ "ready": 1 }));
+    let ready = server.read();
+    assert_eq!(ready["ready"], 1);
 
     let response = server.request(json!({
         "id": 1,

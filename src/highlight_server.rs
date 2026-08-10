@@ -3,13 +3,14 @@ use std::io::{BufRead, Write};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::diff::{DiffColors, DiffStyle, highlight_unified_diff};
 use crate::highlight::{RawCodeHighlighter, bg_escape};
 use crate::theme::CodeTheme;
 
 /// Supported request modes, advertised in the ready line so a client never
 /// wastes a sacrificial request probing capability. Only modes with a live
-/// handler are advertised; unified-diff is added once Phase 2 lands.
-pub const MODES: &[&str] = &["raw", "diff-wash"];
+/// handler are advertised.
+pub const MODES: &[&str] = &["raw", "diff-wash", "unified-diff"];
 
 #[derive(Debug, Deserialize)]
 struct HighlightRequest {
@@ -20,22 +21,10 @@ struct HighlightRequest {
     code: String,
     #[serde(default)]
     wash_per_line: Option<Vec<Option<String>>>,
-    // Phase 2 unified-diff fields; parsed for schema compatibility now,
-    // consumed once unified-diff composition lands. Allowed dead_code.
     #[serde(default)]
-    #[allow(dead_code)]
     colors: Option<DiffColors>,
     #[serde(default, rename = "diffStyle")]
-    #[allow(dead_code)]
     diff_style: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DiffColors {
-    #[serde(default)]
-    inserted: Option<String>,
-    #[serde(default)]
-    deleted: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -79,7 +68,13 @@ pub fn run_highlight_server<R: BufRead, W: Write>(
 
     for line in input.lines() {
         let line = line?;
-        handle_line(&highlighter, &line, &mut output)?;
+        handle_line(
+            &highlighter,
+            code_theme,
+            show_background,
+            &line,
+            &mut output,
+        )?;
     }
 
     Ok(())
@@ -87,6 +82,8 @@ pub fn run_highlight_server<R: BufRead, W: Write>(
 
 fn handle_line<W: Write>(
     highlighter: &RawCodeHighlighter,
+    code_theme: CodeTheme,
+    show_background: bool,
     line: &str,
     output: &mut W,
 ) -> Result<()> {
@@ -101,7 +98,7 @@ fn handle_line<W: Write>(
     match request.mode.as_deref() {
         None | Some("raw") => write_raw(highlighter, &request, output),
         Some("diff-wash") => write_diff_wash(highlighter, &request, output),
-        Some("unified-diff") => write_unified_diff(&request, output),
+        Some("unified-diff") => write_unified_diff(&request, code_theme, show_background, output),
         Some(other) => write_error(output, request.id, format!("unknown mode: {other}")),
     }
 }
@@ -178,16 +175,45 @@ fn write_diff_wash<W: Write>(
     }
 }
 
-/// Placeholder for Phase 2: unified-diff composition. Fails closed (error
-/// response) so a client can detect the mode is not yet supported without
-/// hanging the sequential protocol. Phase 2 implements dual-stream
-/// composition reusing the Phase 1 wash primitive.
-fn write_unified_diff<W: Write>(request: &HighlightRequest, output: &mut W) -> Result<()> {
-    write_error(
-        output,
-        request.id,
-        "unified-diff mode not yet implemented".to_string(),
-    )
+/// Phase 2: unified-diff composition. Reuses the dual-stream engine in
+/// `crate::diff`. Fails closed on invalid colors / unknown diffStyle.
+fn write_unified_diff<W: Write>(
+    request: &HighlightRequest,
+    code_theme: CodeTheme,
+    show_background: bool,
+    output: &mut W,
+) -> Result<()> {
+    let style = match request.diff_style.as_deref() {
+        None | Some("marker-fg") => DiffStyle::MarkerFg,
+        Some("bg-wash") => DiffStyle::BgWash,
+        Some(other) => {
+            return write_error(output, request.id, format!("unknown diffStyle: {other}"));
+        }
+    };
+
+    let colors = match request.colors.as_ref() {
+        Some(c) => c.clone(),
+        None => DiffColors::default(),
+    };
+
+    match highlight_unified_diff(
+        &request.language,
+        &request.code,
+        style,
+        &colors,
+        code_theme,
+        show_background,
+    ) {
+        Ok(ansi) => write_json_line(
+            output,
+            &HighlightResponse {
+                id: request.id,
+                ansi: Some(&ansi),
+                error: None,
+            },
+        ),
+        Err(error) => write_error(output, request.id, error.to_string()),
+    }
 }
 
 fn write_error<W: Write>(output: &mut W, id: u64, message: String) -> Result<()> {
@@ -247,8 +273,10 @@ mod tests {
         let lines = run_once(b"");
         assert_eq!(lines[0]["ready"], 1);
         assert_eq!(lines[0]["protocol"], 2);
-        // Only implemented modes are advertised; unified-diff joins once live.
-        assert_eq!(lines[0]["modes"], serde_json::json!(["raw", "diff-wash"]));
+        assert_eq!(
+            lines[0]["modes"],
+            serde_json::json!(["raw", "diff-wash", "unified-diff"])
+        );
     }
 
     #[test]

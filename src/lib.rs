@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod diff;
 pub mod help;
 pub mod highlight;
 pub mod highlight_server;
