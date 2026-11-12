@@ -4,6 +4,8 @@ All notable changes to `mdstream` are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-11-12
+
 ### Added
 
 - A new hidden `--highlight-server` flag runs `mdstream` as a raw-code highlighting service instead of the streaming Markdown renderer. It speaks a line-delimited JSON protocol over stdin/stdout: once syntect's syntax and theme assets finish loading it writes `{"ready":1,"protocol":2,"modes":["raw","diff-wash","unified-diff"]}`, then for each input line `{"id":N,"language":"...","code":"..."}` it writes exactly one `{"id":N,"ansi":"..."}` response line (or `{"id":N,"error":"..."}` when the request is malformed or highlighting fails). The `ansi` payload carries the code highlighted with no Markdown framing, line numbers, indentation, or padding, so a host process (editor plugin, chat frontend, terminal wrapper) can reuse `mdstream`'s bundled themes and syntect syntaxes without reimplementing highlighting. Requests are handled sequentially; lexical state is fresh per request but retained across lines within it. Input line endings and trailing-newline shape are preserved verbatim, and every non-empty output line ends with an ANSI reset so styling cannot leak into later output. Integration tests in `tests/highlight_server.rs` drive the real binary over pipes: the ready handshake, TypeScript highlighting, unknown-language plaintext fallback, JSON escaping round-trips, and multiline lexical state. The flag is `#[arg(hide = true)]`, so it appears in neither `--help` nor the guard tests.
