@@ -59,6 +59,8 @@ pub fn run(cli: cli::Cli) -> Result<()> {
     );
     renderer.set_table_fit(cli.table_fit);
     renderer.set_table_width_offset(cli.table_width_offset);
+    renderer.set_wrap(cli.wrap);
+    renderer.set_wrap_width_offset(cli.wrap_width_offset);
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
 

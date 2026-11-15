@@ -98,4 +98,114 @@ pub struct Cli {
         help = "Cells to add (+) or subtract (-) from the table-fit cap width; e.g. -10 leaves a 10-cell right gutter."
     )]
     pub table_width_offset: i32,
+
+    #[arg(
+        long,
+        env = "MDSTREAM_WRAP",
+        num_args = 0..=1,
+        default_missing_value = "auto",
+        value_name = "auto|COLS",
+        help_heading = "Text",
+        help = "Wrap long text lines. No value uses the terminal width. COLS (10-1000) sets a fixed width."
+    )]
+    pub wrap: Option<WrapMode>,
+
+    #[arg(
+        long,
+        env = "MDSTREAM_WRAP_WIDTH_OFFSET",
+        default_value_t = 0,
+        allow_negative_numbers = true,
+        value_name = "CELLS",
+        help_heading = "Text",
+        help = "Cells to add (+) or remove (-) from the terminal width when --wrap has no value."
+    )]
+    pub wrap_width_offset: i32,
+}
+
+/// Smallest fixed wrap width that `--wrap COLS` accepts.
+pub const WRAP_MIN_COLS: usize = 10;
+/// Largest fixed wrap width that `--wrap COLS` accepts.
+pub const WRAP_MAX_COLS: usize = 1000;
+
+/// How `--wrap` gets its width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapMode {
+    /// Use the live terminal width plus `--wrap-width-offset`.
+    Auto,
+    /// Use this width. It replaces the terminal width.
+    Fixed(usize),
+}
+
+impl std::str::FromStr for WrapMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("auto") {
+            return Ok(WrapMode::Auto);
+        }
+        let invalid = || {
+            format!(
+                "invalid wrap width '{value}': use 'auto' or an integer from {WRAP_MIN_COLS} to {WRAP_MAX_COLS}"
+            )
+        };
+        let cols = value.parse::<usize>().map_err(|_| invalid())?;
+        if (WRAP_MIN_COLS..=WRAP_MAX_COLS).contains(&cols) {
+            Ok(WrapMode::Fixed(cols))
+        } else {
+            Err(invalid())
+        }
+    }
+}
+
+#[cfg(test)]
+mod wrap_mode_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_auto_and_fixed() {
+        assert_eq!("auto".parse::<WrapMode>(), Ok(WrapMode::Auto));
+        assert_eq!("80".parse::<WrapMode>(), Ok(WrapMode::Fixed(80)));
+        assert_eq!("10".parse::<WrapMode>(), Ok(WrapMode::Fixed(10)));
+        assert_eq!("1000".parse::<WrapMode>(), Ok(WrapMode::Fixed(1000)));
+    }
+
+    #[test]
+    fn rejects_out_of_range_and_garbage() {
+        for bad in ["9", "1001", "0", "-5", "", "abc"] {
+            let err = bad.parse::<WrapMode>().expect_err(bad);
+            assert!(err.contains("auto"), "{err}");
+            assert!(err.contains("10 to 1000"), "{err}");
+        }
+    }
+
+    fn parse(args: &[&str]) -> Cli {
+        let mut argv = vec!["mdstream"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).expect("args should parse")
+    }
+
+    #[test]
+    fn flag_forms() {
+        // Env vars may leak in from the developer shell; these cases only
+        // assert command-line forms, which always win over env.
+        assert_eq!(parse(&["--wrap"]).wrap, Some(WrapMode::Auto));
+        assert_eq!(parse(&["--wrap", "auto"]).wrap, Some(WrapMode::Auto));
+        assert_eq!(parse(&["--wrap", "80"]).wrap, Some(WrapMode::Fixed(80)));
+        assert_eq!(parse(&["--wrap=80"]).wrap, Some(WrapMode::Fixed(80)));
+        let cli = parse(&["--wrap", "--padding", "2"]);
+        assert_eq!(cli.wrap, Some(WrapMode::Auto));
+        assert_eq!(cli.padding, 2);
+        assert_eq!(
+            parse(&["--wrap-width-offset", "-10"]).wrap_width_offset,
+            -10
+        );
+    }
+
+    #[test]
+    fn rejects_small_fixed_width() {
+        let err = Cli::try_parse_from(["mdstream", "--wrap", "5"]).expect_err("5 is too small");
+        assert_eq!(err.exit_code(), 2);
+    }
 }

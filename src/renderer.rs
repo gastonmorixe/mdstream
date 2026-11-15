@@ -1,3 +1,4 @@
+use crate::cli::WrapMode;
 use crate::highlight::{make_highlighter, syntect_assets};
 use crate::theme::{
     CodeTheme, DEFAULT_CODE_THEME, DEFAULT_INLINE_CODE_COLOR, DEFAULT_SHOW_CODE_BACKGROUND,
@@ -30,6 +31,10 @@ const FG_DEFAULT: &str = "\x1b[39m";
 /// label line and closing border). Kept constant so the top and bottom of a
 /// code block always line up regardless of terminal width.
 const CODE_FRAME_WIDTH: usize = 40;
+
+/// Smallest content budget (cells) on which `--wrap` breaks a line. A line
+/// whose budget after its prefix is smaller renders unwrapped.
+const WRAP_MIN_BUDGET: usize = 10;
 const BRIGHT_BLUE: &str = "\x1b[94m";
 const BRIGHT_GREEN: &str = "\x1b[92m";
 const BRIGHT_MAGENTA: &str = "\x1b[95m";
@@ -539,15 +544,26 @@ fn redistribute_remainder(widths: &mut [usize], order: &[usize], mut remainder: 
 /// - empty `text` → returns `[""]`.
 /// - `text` already fits on one line → returns `[text]` verbatim.
 fn wrap_styled_cell(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
+    wrap_styled(text, width, width)
+}
+
+/// [`wrap_styled_cell`] with a separate budget for the first row
+/// (`first_width`) and for every continuation row (`next_width`). Used by
+/// `--wrap`, where the first row of a list item carries the marker and
+/// later rows carry an indent of a possibly different width.
+fn wrap_styled(text: &str, first_width: usize, next_width: usize) -> Vec<String> {
+    if first_width == 0 || next_width == 0 {
         return vec![String::new()];
     }
     if text.is_empty() {
         return vec![String::new()];
     }
-    if visible_width(text) <= width {
+    if visible_width(text) <= first_width {
         return vec![text.to_owned()];
     }
+    // Budget of the row that is currently being filled. Row 1 uses
+    // `first_width`; every later row uses `next_width`.
+    let row_width = |rows: usize| if rows <= 1 { first_width } else { next_width };
 
     // Tokenize: ANSI escapes are zero-width passthroughs; non-ANSI
     // chunks are split into whitespace runs vs non-whitespace
@@ -713,8 +729,14 @@ fn wrap_styled_cell(text: &str, width: usize) -> Vec<String> {
         cur_w: &mut usize,
         needs_space: &mut bool,
         piece: &WordPiece<'_>,
-        width: usize,
+        first_width: usize,
+        next_width: usize,
     ) {
+        let width = if lines.len() <= 1 {
+            first_width
+        } else {
+            next_width
+        };
         let prefix = piece.prefix.as_str();
         let glyph = piece.glyph;
         let gw = piece.width;
@@ -760,7 +782,7 @@ fn wrap_styled_cell(text: &str, width: usize) -> Vec<String> {
             }
             Atom::Word(pieces, w) => {
                 let sep = if cur_w > 0 && needs_space { 1 } else { 0 };
-                if cur_w > 0 && cur_w + sep + w > width && *w <= width {
+                if cur_w > 0 && cur_w + sep + w > row_width(lines.len()) && *w <= next_width {
                     // Whole word fits on a fresh line — wrap before
                     // placing it (cleaner than mid-word break).
                     lines.last_mut().unwrap().push_str(RESET);
@@ -775,7 +797,8 @@ fn wrap_styled_cell(text: &str, width: usize) -> Vec<String> {
                         &mut cur_w,
                         &mut needs_space,
                         piece,
-                        width,
+                        first_width,
+                        next_width,
                     );
                 }
                 needs_space = true;
@@ -1281,6 +1304,11 @@ pub struct StreamingMarkdownRenderer {
     /// expand it past 100% (rarely useful, but symmetric). Has no
     /// effect when `table_fit` is `false`.
     table_width_offset: i32,
+    /// `--wrap` mode. `None` means no wrapping (the default).
+    wrap: Option<WrapMode>,
+    /// Signed offset added to the detected terminal width in
+    /// [`WrapMode::Auto`]. Ignored in [`WrapMode::Fixed`].
+    wrap_width_offset: i32,
     term_width_override: Option<usize>,
     /// Number of fully-wrapped rows the current partial occupies ABOVE the
     /// cursor's current row. Total visual rows for the partial =
@@ -1392,6 +1420,8 @@ impl StreamingMarkdownRenderer {
             show_list_guides,
             table_fit: false,
             table_width_offset: 0,
+            wrap: None,
+            wrap_width_offset: 0,
             term_width_override: None,
             partial_rows: 0,
             partial_col: 0,
@@ -1440,6 +1470,18 @@ impl StreamingMarkdownRenderer {
         {
             renderer.table_width_offset = offset;
         }
+        if let Some(mode) = std::env::var("MDSTREAM_WRAP")
+            .ok()
+            .and_then(|s| s.parse::<WrapMode>().ok())
+        {
+            renderer.wrap = Some(mode);
+        }
+        if let Some(offset) = std::env::var("MDSTREAM_WRAP_WIDTH_OFFSET")
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+        {
+            renderer.wrap_width_offset = offset;
+        }
         renderer
     }
 
@@ -1458,6 +1500,68 @@ impl StreamingMarkdownRenderer {
     /// edge cases). Has no effect unless `table_fit` is enabled.
     pub fn set_table_width_offset(&mut self, offset: i32) {
         self.table_width_offset = offset;
+    }
+
+    /// Set the `--wrap` mode. `None` turns wrapping off (the default).
+    /// [`WrapMode::Auto`] wraps at the live terminal width plus the wrap
+    /// offset. [`WrapMode::Fixed`] wraps at exactly that width and does
+    /// not read the terminal.
+    pub fn set_wrap(&mut self, mode: Option<WrapMode>) {
+        self.wrap = mode;
+    }
+
+    /// Cells to add (+) or remove (-) from the terminal width in
+    /// [`WrapMode::Auto`]. Has no effect in [`WrapMode::Fixed`].
+    pub fn set_wrap_width_offset(&mut self, offset: i32) {
+        self.wrap_width_offset = offset;
+    }
+
+    /// The maximum row width for wrapped text, prefix included. `None`
+    /// means "do not wrap": wrapping is off, or auto mode found no live
+    /// width, or the offset leaves no width.
+    fn wrap_width(&self) -> Option<usize> {
+        match self.wrap? {
+            WrapMode::Fixed(cols) => Some(cols),
+            WrapMode::Auto => {
+                let cols = self.detect_live_columns()? as i64;
+                let target = cols + i64::from(self.wrap_width_offset);
+                (target > 0).then_some(target as usize)
+            }
+        }
+    }
+
+    /// Render `first_prefix + body` as one or more rows. When wrapping is
+    /// on and the body does not fit, break it at spaces with
+    /// [`wrap_styled`] and start each continuation row with
+    /// `next_prefix`. Otherwise return the unwrapped row, byte-identical
+    /// to the output without `--wrap`.
+    fn wrap_with_prefix(&self, first_prefix: &str, next_prefix: &str, body: &str) -> String {
+        let unwrapped = || format!("{first_prefix}{body}\n");
+        let Some(width) = self.wrap_width() else {
+            return unwrapped();
+        };
+        let (Some(first_budget), Some(next_budget)) = (
+            width.checked_sub(visible_width(first_prefix)),
+            width.checked_sub(visible_width(next_prefix)),
+        ) else {
+            return unwrapped();
+        };
+        if first_budget < WRAP_MIN_BUDGET || next_budget < WRAP_MIN_BUDGET {
+            return unwrapped();
+        }
+        if visible_width(body) <= first_budget {
+            return unwrapped();
+        }
+        let mut out = String::new();
+        for (idx, row) in wrap_styled(body, first_budget, next_budget)
+            .iter()
+            .enumerate()
+        {
+            out.push_str(if idx == 0 { first_prefix } else { next_prefix });
+            out.push_str(row);
+            out.push('\n');
+        }
+        out
     }
 
     pub fn render_line(&mut self, line: &str) -> String {
@@ -1776,7 +1880,9 @@ impl StreamingMarkdownRenderer {
 
         self.set_list_context(&rendered_prefix, source_indent_width, marker_width);
         let rendered_body = format_inline(body, self.inline_code_color);
-        format!("{rendered_prefix}{marker_text} {rendered_body}\n")
+        let first_prefix = format!("{rendered_prefix}{marker_text} ");
+        let next_prefix = format!("{rendered_prefix}{}", " ".repeat(marker_width + 1));
+        self.wrap_with_prefix(&first_prefix, &next_prefix, &rendered_body)
     }
 
     fn render_list_continuation(&self, prefix: &str, text: &str) -> Option<String> {
@@ -1796,11 +1902,8 @@ impl StreamingMarkdownRenderer {
         }
 
         let _ = prefix; // continuation_prefix already includes the full prefix
-        Some(format!(
-            "{}{}\n",
-            ctx.continuation_prefix,
-            format_inline(trimmed, self.inline_code_color)
-        ))
+        let body = format_inline(trimmed, self.inline_code_color);
+        Some(self.wrap_with_prefix(&ctx.continuation_prefix, &ctx.continuation_prefix, &body))
     }
 
     fn render_noncode_line(&mut self, stripped: &str) -> String {
@@ -2096,7 +2199,8 @@ impl StreamingMarkdownRenderer {
         } else {
             text
         };
-        format!("{prefix}{}\n", format_inline(body, self.inline_code_color))
+        let body = format_inline(body, self.inline_code_color);
+        self.wrap_with_prefix(prefix, prefix, &body)
     }
 
     fn flush_buffered_table(&mut self) -> String {
@@ -3573,5 +3677,39 @@ mod wrap_styled_cell_tests {
                 "VS16 was orphaned onto a continuation line: {lines:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod wrap_styled_tests {
+    //! `wrap_styled(text, first, next)` gives row 1 a budget of `first`
+    //! cells and every later row a budget of `next` cells (`--wrap`).
+    use super::*;
+
+    const TEXT: &str = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda";
+
+    #[test]
+    fn first_and_next_budgets_are_honored() {
+        let rows = wrap_styled(TEXT, 12, 24);
+        assert!(rows.len() > 2, "{rows:?}");
+        assert!(visible_width(&rows[0]) <= 12, "{rows:?}");
+        for row in &rows[1..] {
+            assert!(visible_width(row) <= 24, "{rows:?}");
+        }
+        // Row 2 must use the wider budget, not the first-row budget.
+        assert!(visible_width(&rows[1]) > 12, "{rows:?}");
+    }
+
+    #[test]
+    fn rows_have_no_trailing_spaces() {
+        for row in wrap_styled(TEXT, 11, 17) {
+            let plain = ansi_re().replace_all(&row, "");
+            assert!(!plain.ends_with(' '), "{row:?}");
+        }
+    }
+
+    #[test]
+    fn equal_budgets_match_wrap_styled_cell() {
+        assert_eq!(wrap_styled(TEXT, 15, 15), wrap_styled_cell(TEXT, 15));
     }
 }

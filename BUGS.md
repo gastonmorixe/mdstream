@@ -408,7 +408,7 @@ TOTAL VERIFIED BUGS: 16
 - **Actual**: output retains the trailing spaces verbatim (`foo   `, `Foo  `). Trailing whitespace on a line is not trimmed.
 - **Severity**: medium
 
-### [064] No width-aware paragraph wrapping; long lines overflow terminal width
+### [064] No width-aware paragraph wrapping; long lines overflow terminal width  [fixed (opt-in, `--wrap`) in 0.3.8]
 - **Input**: `The quick brown fox ... forever and ever.` (106 chars) at COLUMNS=40 / 80
 - **Expected**: the renderer should soft-wrap the paragraph to the terminal width on word boundaries with no mid-word breaks
 - **Actual**: mdstream emits the paragraph as one physical line of full length (97/106 cells) regardless of COLUMNS (verified: identical output length at COLUMNS=20 and COLUMNS=200, piped). It performs no wrapping and relies on the terminal's own soft-wrap, which breaks mid-word at the raw cell boundary. No continuation indentation is applied.
@@ -663,6 +663,9 @@ line-by-line renderer never has the whole document in hand. Inline links
 (`[text](url)`) are fully supported.
 
 ### Width-aware paragraph soft-wrapping  [by-design]
-mdstream does not hard-wrap paragraph text; it relies on the terminal's own
-soft-wrap. This is intentional (keeps output copy-pasteable and lets the
-terminal reflow on resize). Tables DO get width-aware wrapping via --table-fit.
+By default mdstream does not hard-wrap paragraph text; it relies on the
+terminal's own soft-wrap. This is intentional (keeps output copy-pasteable and
+lets the terminal reflow on resize). The default does not change. Since 0.3.8,
+opt-in `--wrap` (terminal width) or `--wrap COLS` (fixed width) wraps
+paragraphs, list items, and blockquotes at spaces with hanging indents. Tables
+get width-aware wrapping via --table-fit.

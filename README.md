@@ -36,6 +36,7 @@ mdstream takes the **opposite approach**. Raw partial lines stream straight to t
 - 💻 **Fenced code blocks**: `syntect`-backed highlighting with bundled built-in themes, vendored third-party themes, a custom mdstream house theme, foreground-only rendering by default, optional themed backgrounds, optional line numbers, and language-specific label colors for ~30 common languages including Rust, Python, JS/TS, Go, Ruby, Java, Swift, Bash, Zig, Elixir, Haskell, and friends.
 - ✨ **Inline formatting**: bold, italic, bold+italic, strikethrough, code spans, links, images, autolinks, bare URLs (with adjacency guard), and backslash escapes for the full Markdown punctuation set.
 - 💬 **Blockquotes**: depth tracking, tab- and unicode-whitespace-tolerant parsing, and dimmed `│` bars.
+- ↩️ **Opt-in word wrap**: `--wrap` breaks long paragraph, list, and blockquote lines at spaces to fit the terminal width (or a fixed `--wrap 80`). Continuation rows keep the list indent, guides, and `│` bars, and bold/color carries across every break.
 - 🌐 **True Unicode display width**: via `unicode-width`, so CJK, fullwidth digits, and emoji all align correctly inside tables and wrap math.
 - 🛡️ **Broken-pipe safe**: piping into `head` or quitting `less` exits cleanly with code 0.
 - 📦 **Single static binary**: pure Rust, no C dependencies (`syntect` runs in `default-fancy` mode).
@@ -128,6 +129,8 @@ mdstream takes flags or environment variables. **Flags win** when both are set.
 | `--padding N` | `MDSTREAM_PADDING` | `0` | Left padding in spaces |
 | `--no-lineno` | `MDSTREAM_NO_LINENO` | off | Hide line numbers in fenced code blocks |
 | `--no-list-guides` | `MDSTREAM_NO_LIST_GUIDES` | off | Hide vertical guides on nested lists |
+| `--wrap [auto\|COLS]` | `MDSTREAM_WRAP` | off | Wrap long text lines at spaces. No value (or `auto`) uses the live terminal width; `COLS` (10-1000) sets a fixed width that replaces the terminal width |
+| `--wrap-width-offset N` | `MDSTREAM_WRAP_WIDTH_OFFSET` | `0` | Cells to add (+) or subtract (-) from the terminal width when `--wrap` has no value; ignored with `--wrap COLS` |
 | `--theme THEME` | `MDSTREAM_THEME` | `mdstream` | Code theme for fenced code blocks |
 | `--inline-code-color COLOR` | `MDSTREAM_INLINE_CODE_COLOR` | `h5` | Inline code accent from the `h1`-`h6` palette |
 | `--code-background` | `MDSTREAM_CODE_BACKGROUND` | off | Enable themed backgrounds in fenced code blocks |
@@ -136,6 +139,22 @@ mdstream takes flags or environment variables. **Flags win** when both are set.
 | `--table-width-offset N` | `MDSTREAM_TABLE_WIDTH_OFFSET` | `0` | Cells to add (+) or subtract (-) from the table-fit cap width |
 
 Run `mdstream --help` for the full surface.
+
+### Word wrap
+
+By default mdstream prints each line as-is and lets the terminal soft-wrap it, which keeps copied text clean and lets the terminal reflow on resize. Turn on `--wrap` to have mdstream break lines itself:
+
+```bash
+mdstream --wrap < notes.md                         # wrap at the terminal width
+mdstream --wrap --wrap-width-offset -10 < notes.md # leave a 10-cell right gutter
+mdstream --wrap 80 < notes.md                      # wrap at 80 cells, even in a pipe
+```
+
+- Wraps paragraphs, list items (bullet, ordered, task), and blockquotes. Code blocks, tables (see `--table-fit`), headings, and rules are not wrapped.
+- Breaks at spaces with greedy fill; a word wider than the line is broken at the edge.
+- `--wrap` (auto) reads `COLUMNS`, then the terminal. When neither gives a width (for example, output to a pipe), it does not wrap.
+- `--wrap COLS` never reads the terminal. If the terminal is narrower than `COLS`, the terminal also wraps the rows.
+- Text with no spaces (CJK) is broken at the line edge; CJK display widths are measured correctly.
 
 ## CI and releases
 

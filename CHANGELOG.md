@@ -4,6 +4,22 @@ All notable changes to `mdstream` are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-11-15
+
+### Added
+
+- Opt-in word wrap. `--wrap` (env `MDSTREAM_WRAP`) breaks long paragraph, list-item (bullet, ordered, task), and blockquote lines at spaces so each row fits the wrap width. `--wrap` with no value (or `auto`) uses the live terminal width (`COLUMNS`, then the terminal). `--wrap COLS` (10-1000) uses exactly `COLS` cells and replaces the terminal width, so it also works in pipes and files. Out-of-range or non-numeric values exit with code 2. Without `--wrap`, output is byte-identical to 0.3.7.
+- `--wrap-width-offset N` (env `MDSTREAM_WRAP_WIDTH_OFFSET`, signed) adds or removes cells from the terminal width in auto mode, e.g. `-10` leaves a 10-cell right gutter. It has no effect with `--wrap COLS`.
+- Wrapping is greedy and per source line, so it needs no lookahead and works on streamed input. Continuation rows hang under the item text and keep the left padding, list indent guides, and blockquote `│` bars. Active bold/color is closed at the end of each wrapped row and re-opened on the next. Words wider than the line are broken at the edge, base characters stay joined to their variation selector (`⚠️`), and CJK display widths are measured in cells. A line whose budget after its prefix is under 10 cells is left unwrapped.
+- Code blocks, tables (still governed by `--table-fit`), headings, thematic breaks, and the live partial row are not wrapped.
+- Spec with numbered tasks and acceptance criteria: `research/2026-11-15-opt-in-word-wrap/SPEC.md`. Integration tests in `tests/wrap.rs`; unit tests in `cli::wrap_mode_tests` and `renderer::wrap_styled_tests`.
+
+### Changed
+
+- `--help` lists the new flags under a new "Text" section and shows optional values in square brackets (`--wrap [auto|COLS]`).
+- The table-cell wrapper is now `wrap_styled(text, first_width, next_width)` with separate first-row and continuation-row budgets. `wrap_styled_cell` calls it with equal budgets, so table output is unchanged.
+- BUGS.md [064] is marked fixed (opt-in). The default still relies on the terminal's soft-wrap.
+
 ## [0.3.7] - 2026-11-12
 
 ### Added

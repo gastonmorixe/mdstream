@@ -52,6 +52,15 @@ and replaces it with the formatted line via `erase_partial`.
   possible header row is parked in `pending_table_header`, then
   rows accumulate in `table_lines`, and the whole table is emitted
   only when the renderer knows the shape.
+- Word wrap (opt-in `--wrap`): paragraph, list-item, and blockquote
+  rows go through `wrap_with_prefix`. It gets the wrap width from
+  `wrap_width` (fixed `--wrap COLS`, or the live terminal width plus
+  `--wrap-width-offset`), subtracts the visible width of the line's
+  prefix, and calls `wrap_styled`, the same ANSI-aware greedy wrapper
+  that `--table-fit` uses for cells. Continuation rows get a hanging
+  prefix (list indent and guides, `│` bars) and re-open any active
+  style. Wrapping is per source line, so it adds no lookahead and
+  works on streamed input. Without `--wrap` the output is unchanged.
 
 So the design is:
 

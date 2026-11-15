@@ -22,7 +22,7 @@ pub const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
 /// in [`crate::cli::Cli`] without a `help_heading` (or with one not
 /// listed here) lands in `Other` at the bottom — so a forgotten
 /// grouping shows up obviously instead of vanishing.
-const SECTION_ORDER: &[&str] = &["Display", "Code highlighting", "Tables"];
+const SECTION_ORDER: &[&str] = &["Display", "Text", "Code highlighting", "Tables"];
 
 /// Pseudo-heading we synthesize for `--help` / `--version`. clap
 /// auto-injects these and they don't carry a `help_heading`; we
@@ -172,7 +172,16 @@ fn render_flag_line(arg: &Arg, long: &str) -> String {
         .get_value_names()
         .and_then(|names| names.first().cloned())
         .filter(|_| takes_value(arg))
-        .map(|name| format!(" <{name}>"))
+        .map(|name| {
+            // An optional value (`num_args = 0..=1`, e.g. `--wrap`) shows
+            // in square brackets; a required value in angle brackets.
+            let optional = arg.get_num_args().is_some_and(|n| n.min_values() == 0);
+            if optional {
+                format!(" [{name}]")
+            } else {
+                format!(" <{name}>")
+            }
+        })
         .unwrap_or_default();
 
     let help_text = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
@@ -337,5 +346,20 @@ mod tests {
             tables_idx < table_fit_idx,
             "--table-fit should appear under the Tables heading"
         );
+    }
+
+    #[test]
+    fn help_markdown_lists_wrap_flags_under_text_heading() {
+        let help = help_markdown();
+        let text_idx = help.find("### Text").expect("Text heading missing");
+        let wrap_idx = help
+            .find("`--wrap [auto|COLS]`")
+            .expect("--wrap with optional value missing");
+        let offset_idx = help
+            .find("`--wrap-width-offset <CELLS>`")
+            .expect("--wrap-width-offset missing");
+        assert!(text_idx < wrap_idx && text_idx < offset_idx);
+        assert!(help.contains("MDSTREAM_WRAP"));
+        assert!(help.contains("MDSTREAM_WRAP_WIDTH_OFFSET"));
     }
 }
