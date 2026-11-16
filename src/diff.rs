@@ -98,6 +98,29 @@ pub fn highlight_unified_diff(
     code_theme: CodeTheme,
     show_background: bool,
 ) -> Result<String> {
+    highlight_unified_diff_with_budget(
+        language,
+        code,
+        style,
+        colors,
+        code_theme,
+        show_background,
+        CONTEXT_LINE_BUDGET,
+    )
+}
+
+/// [`highlight_unified_diff`] with an explicit context-line budget. A budget
+/// of 0 disables context continuity entirely, which tests use as the
+/// pre-continuity reference rendering.
+fn highlight_unified_diff_with_budget(
+    language: &str,
+    code: &str,
+    style: DiffStyle,
+    colors: &DiffColors,
+    code_theme: CodeTheme,
+    show_background: bool,
+    context_line_budget: usize,
+) -> Result<String> {
     // Fail closed on already-ANSI input: re-encoding escape sequences would
     // corrupt the payload, and the caller cannot round-trip them.
     if code.contains('\x1b') {
@@ -106,6 +129,48 @@ pub fn highlight_unified_diff(
 
     let mut from = LineHighlighter::new(language, code_theme, show_background);
     let mut to = LineHighlighter::new(language, code_theme, show_background);
+    // Context lines are rendered verbatim, but they are still source that the
+    // old and new file both contain. They are lexed (output discarded) so
+    // lexical state carries across them: a `/*` opened on a context line must
+    // keep the next `+` line inside the comment, and a `<?php` on a context
+    // line must put the PHP grammar into PHP mode.
+    //
+    // Cost control. Context usually dominates a patch, so this pass must stay
+    // close to the old cost:
+    // - A context line is fed to a stream only when that stream still emits a
+    //   changed line later in the same file. Trailing context and the context
+    //   of an add-only or delete-only file never reach a lexer.
+    // - While both streams hold identical state (the common case: no changed
+    //   line since the last sync, or changes that ended in the same state),
+    //   the line is lexed once and the state is copied.
+    //
+    // Structure comes from `line_roles`, a hunk-aware pass. Preamble and file
+    // headers never reach a lexer, so a quote in a file name cannot poison
+    // the first hunk. Each file starts fresh state.
+    let lines: Vec<&str> = code.split_inclusive('\n').collect();
+    let roles = line_roles(&lines);
+    let kinds: Vec<LineKind> = lines
+        .iter()
+        .map(|line| classify(split_ending(line).0).0)
+        .collect();
+    let (from_emits_later, to_emits_later) = streams_emit_later(&roles, &kinds);
+    // Hard bound on the extra work, decided UP FRONT and per file, all or
+    // nothing. Stopping part-way is wrong, not just less informed: a `/*` fed
+    // before the cut whose `*/` falls after it would leave every later changed
+    // line styled as comment. A file is therefore either fed in full or not at
+    // all, and an unfed file renders as it did before context continuity
+    // existed. Files are admitted greedily in patch order, so one huge file
+    // does not cost the small files around it their continuity. Each file
+    // starts fresh state, so the files are independent.
+    let fed: Vec<bool> = (0..lines.len())
+        .map(|index| {
+            let content = split_ending(lines[index]).0;
+            roles[index] == Role::Body
+                && (content.is_empty() || content.starts_with(' '))
+                && (from_emits_later[index] || to_emits_later[index])
+        })
+        .collect();
+    let file_fed = admit_files(&roles, &fed, context_line_budget);
 
     let (inserted_hex, deleted_hex) = colors.resolved();
     let inserted_fg = fg_escape(&inserted_hex)
@@ -122,8 +187,43 @@ pub fn highlight_unified_diff(
     let mut output = String::with_capacity(code.len() * 2);
     let mut pending_no_newline: Option<(String, String)> = None;
 
-    for line in code.split_inclusive('\n') {
+    // Index into `file_fed`: 0 is anything before the first file header.
+    let mut file = 0;
+    for (index, line) in lines.iter().enumerate() {
         let (content, ending) = split_ending(line);
+
+        if roles[index] == Role::FileStart {
+            file += 1;
+        }
+        match roles[index] {
+            // A new file in a multi-file patch starts fresh lexical state, so
+            // one file's unterminated comment cannot bleed into the next file.
+            Role::FileStart => {
+                from = LineHighlighter::new(language, code_theme, show_background);
+                to = LineHighlighter::new(language, code_theme, show_background);
+            }
+            // Some tools strip the single space from blank context lines, so
+            // an empty line inside a hunk is blank context.
+            _ if fed[index] && file_fed[file] => {
+                let body = content.strip_prefix(' ').unwrap_or(content);
+                match (from_emits_later[index], to_emits_later[index]) {
+                    (true, true) if from.same_state(&to) => {
+                        to.advance(body)?;
+                        from.copy_state_from(&to);
+                    }
+                    (true, true) => {
+                        from.advance(body)?;
+                        to.advance(body)?;
+                    }
+                    (true, false) => from.advance(body)?,
+                    (false, true) => to.advance(body)?,
+                    // `fed` requires a live stream. Fail safe on the request
+                    // path: a panic would kill the highlight server.
+                    (false, false) => debug_assert!(false, "`fed` requires a live stream"),
+                }
+            }
+            _ => {}
+        }
 
         // Handle `\ No newline at end of file`: the previous body line should
         // not get the trailing newline appended. Render it now.
@@ -211,6 +311,157 @@ fn split_ending(line: &str) -> (&str, &str) {
     } else {
         (line, "")
     }
+}
+
+/// Maximum context lines fed to the lexers per request. A fed line costs one
+/// lex while both streams share state (the common case) and two otherwise, at
+/// a measured ~0.15 ms per lex for the heaviest bundled grammars
+/// (JavaScript/TypeScript). The bound is therefore ~150 ms typical and ~300 ms
+/// worst case over the pre-continuity cost. Real edit hunks carry a few dozen
+/// context lines, so this only binds on very large, dense patches.
+const CONTEXT_LINE_BUDGET: usize = 1_000;
+
+/// Decides, per file section, whether its context is fed: greedily in patch
+/// order, a file is admitted when ALL of its fed lines fit the remaining
+/// budget. Index 0 is the section before the first `FileStart`.
+fn admit_files(roles: &[Role], fed: &[bool], budget: usize) -> Vec<bool> {
+    let mut counts = vec![0usize];
+    for (role, fed) in roles.iter().zip(fed) {
+        if *role == Role::FileStart {
+            counts.push(0);
+        }
+        if *fed {
+            *counts.last_mut().unwrap() += 1;
+        }
+    }
+    let mut remaining = budget;
+    counts
+        .into_iter()
+        .map(|count| {
+            let admit = count <= remaining;
+            if admit {
+                remaining -= count;
+            }
+            admit
+        })
+        .collect()
+}
+
+/// Structural role of one patch line, for lexer feeding only. Rendering still
+/// uses [`classify`], so output colors of headers and markers are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// Opens a new file section: lexical state resets here.
+    FileStart,
+    /// Preamble, `+++` header, or a hunk header. Never lexed.
+    Structure,
+    /// A line inside a hunk.
+    Body,
+}
+
+/// Assigns a [`Role`] to every line with a hunk-aware pass.
+///
+/// When a hunk header carries line counts (`@@ -a,b +c,d @@`), the hunk ends
+/// exactly when both counts are consumed. A deleted `-- x` line (`--- x` in
+/// the patch) or an added `++ y` line (`+++ y`) inside a hunk is then body,
+/// never a file header, so it cannot reset state mid-file.
+///
+/// A bare `@@` with no counts (hand-written patches) leaves the hunk
+/// open-ended. There, a `---` / `+++` / `@@` triple is taken as a new file.
+/// A false reset only drops back to fresh state, which is the pre-continuity
+/// behavior. A missed reset would carry one file's comment into the next.
+fn line_roles(lines: &[&str]) -> Vec<Role> {
+    let content = |i: usize| lines.get(i).map(|line| split_ending(line).0);
+    let header_triple = |i: usize| {
+        content(i).is_some_and(|l| l.starts_with("--- "))
+            && content(i + 1).is_some_and(|l| l.starts_with("+++ "))
+            && content(i + 2).is_some_and(|l| l.starts_with("@@"))
+    };
+
+    // `None`: outside a hunk. `Some(None)`: open-ended hunk. `Some(Some(..))`:
+    // remaining (old, new) line counts.
+    let mut hunk: Option<Option<(u64, u64)>> = None;
+    let mut roles = Vec::with_capacity(lines.len());
+    for index in 0..lines.len() {
+        let line = content(index).unwrap_or("");
+        if let Some(Some((0, 0))) = hunk {
+            hunk = None;
+        }
+        let role = if line.starts_with("diff ") {
+            // Body lines start with ` `, `+`, `-` or `\`, so a `diff ` line is
+            // always preamble.
+            hunk = None;
+            Role::FileStart
+        } else if line.starts_with("@@") && !matches!(hunk, Some(Some(_))) {
+            hunk = Some(hunk_counts(line));
+            Role::Structure
+        } else if hunk.is_none() {
+            if line.starts_with("--- ") {
+                Role::FileStart
+            } else {
+                Role::Structure
+            }
+        } else if hunk == Some(None) && header_triple(index) {
+            hunk = None;
+            Role::FileStart
+        } else {
+            if let Some(Some((old, new))) = hunk.as_mut() {
+                match line.as_bytes().first() {
+                    Some(b'-') => *old = old.saturating_sub(1),
+                    Some(b'+') => *new = new.saturating_sub(1),
+                    Some(b'\\') => {}
+                    _ => {
+                        *old = old.saturating_sub(1);
+                        *new = new.saturating_sub(1);
+                    }
+                }
+            }
+            Role::Body
+        };
+        roles.push(role);
+    }
+    roles
+}
+
+/// Parses `@@ -a[,b] +c[,d] @@` into the (old, new) line counts. An omitted
+/// count means 1. Returns `None` when the header has no parseable ranges.
+fn hunk_counts(header: &str) -> Option<(u64, u64)> {
+    let mut parts = header.strip_prefix("@@")?.split_whitespace();
+    let count = |range: &str| -> Option<u64> {
+        match range.split_once(',') {
+            Some((start, len)) => {
+                start.parse::<u64>().ok()?;
+                len.parse().ok()
+            }
+            None => range.parse::<u64>().ok().map(|_| 1),
+        }
+    };
+    let old = count(parts.next()?.strip_prefix('-')?)?;
+    let new = count(parts.next()?.strip_prefix('+')?)?;
+    Some((old, new))
+}
+
+/// For each line, whether the from (deleted) and to (added) streams still
+/// emit a changed line later in the same file. Context after a stream's last
+/// emitted line can never affect output, so it is not lexed for that stream.
+fn streams_emit_later(roles: &[Role], kinds: &[LineKind]) -> (Vec<bool>, Vec<bool>) {
+    let mut from = vec![false; roles.len()];
+    let mut to = vec![false; roles.len()];
+    let (mut from_later, mut to_later) = (false, false);
+    for index in (0..roles.len()).rev() {
+        from[index] = from_later;
+        to[index] = to_later;
+        if roles[index] == Role::FileStart {
+            from_later = false;
+            to_later = false;
+        }
+        match kinds[index] {
+            LineKind::Deleted => from_later = true,
+            LineKind::Added => to_later = true,
+            LineKind::Context => {}
+        }
+    }
+    (from, to)
 }
 
 /// Classifies a body line and returns (kind, content-after-marker).
@@ -306,6 +557,285 @@ mod tests {
             "added stream should have function-color tokens: {:?}",
             ansi
         );
+    }
+
+    /// Distinct truecolor foregrounds on the first output line that starts
+    /// with the colored `+` marker.
+    fn added_row_colors(ansi: &str) -> std::collections::BTreeSet<String> {
+        let fg = regex::Regex::new(r"\x1b\[38;2;[0-9;]+m").unwrap();
+        let row = ansi
+            .split('\n')
+            .find(|row| strip_ansi(row).starts_with('+') && !row.starts_with('+'))
+            .expect("an added row");
+        fg.find_iter(row).map(|m| m.as_str().to_owned()).collect()
+    }
+
+    #[test]
+    fn context_lines_carry_lexical_state_into_changed_lines() {
+        // Regression: context lines were rendered verbatim and never lexed, so
+        // a block comment opened on a context line did not reach the `+` line
+        // inside it, which was then colored as live code.
+        let code = "--- a/x.ts\n+++ b/x.ts\n@@ -1,2 +1,3 @@\n /* opened in context\n+const notCode = 1 */\n }\n";
+        let ansi = highlight_unified_diff(
+            "typescript",
+            code,
+            DiffStyle::MarkerFg,
+            &default_colors(),
+            CodeTheme::Mdstream,
+            false,
+        )
+        .unwrap();
+        assert_eq!(strip_ansi(&ansi), code);
+        let keyword_blue = "\x1b[38;2;123;167;255m";
+        let number_amber = "\x1b[38;2;255;183;94m";
+        let colors = added_row_colors(&ansi);
+        assert!(
+            !colors.contains(keyword_blue) && !colors.contains(number_amber),
+            "added line inside a context-opened comment must not get code colors: {:?}",
+            ansi
+        );
+    }
+
+    #[test]
+    fn php_open_tag_on_context_line_enters_php_mode() {
+        let code =
+            "--- a/x.php\n+++ b/x.php\n@@ -1,2 +1,3 @@\n <?php\n+$x = \"s\" . 1;\n echo $x;\n";
+        let ansi = highlight_unified_diff(
+            "php",
+            code,
+            DiffStyle::MarkerFg,
+            &default_colors(),
+            CodeTheme::Mdstream,
+            false,
+        )
+        .unwrap();
+        assert_eq!(strip_ansi(&ansi), code);
+        // Marker + base only was the flat bug (2). PHP tokens add string,
+        // punctuation and number colors.
+        assert!(
+            added_row_colors(&ansi).len() >= 4,
+            "added PHP line must be token-colored: {:?}",
+            ansi
+        );
+    }
+
+    #[test]
+    fn file_headers_and_preamble_never_reach_the_lexer() {
+        // A quote in a file name must not open a string that swallows the
+        // first hunk. Compare against the same hunk with neutral headers.
+        let hunk = "@@ -1 +1 @@\n-let a = 1;\n+let b = 2;\n";
+        let quoted =
+            format!("diff --git a/it's.rs b/it's.rs\n--- \"a/it's.rs\n+++ \"b/it's.rs\n{hunk}");
+        let neutral = format!("--- a/x.rs\n+++ b/x.rs\n{hunk}");
+        let render = |code: &str| {
+            highlight_unified_diff(
+                "rust",
+                code,
+                DiffStyle::MarkerFg,
+                &default_colors(),
+                CodeTheme::Mdstream,
+                false,
+            )
+            .unwrap()
+        };
+        let tail = |ansi: String| {
+            ansi.split('\n')
+                .skip_while(|row| !row.starts_with("@@"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(tail(render(&quoted)), tail(render(&neutral)));
+    }
+
+    #[test]
+    fn each_file_in_a_multi_file_patch_starts_fresh() {
+        // An unterminated comment in the first file's context must not turn
+        // the second file's added line into a comment.
+        let code = "--- a/a.ts\n+++ b/a.ts\n@@ -1 +1,2 @@\n /* never closed\n+x\n\
+                    --- a/b.ts\n+++ b/b.ts\n@@ -1 +1 @@\n-old\n+const live = 1;\n";
+        let ansi = highlight_unified_diff(
+            "typescript",
+            code,
+            DiffStyle::MarkerFg,
+            &default_colors(),
+            CodeTheme::Mdstream,
+            false,
+        )
+        .unwrap();
+        assert_eq!(strip_ansi(&ansi), code);
+        let last_added = ansi
+            .split('\n')
+            .find(|row| strip_ansi(row).starts_with("+const"))
+            .unwrap();
+        assert!(
+            last_added.contains("\x1b[38;2;123;167;255m"),
+            "second file's added line must be live code: {:?}",
+            last_added
+        );
+    }
+
+    #[test]
+    fn body_lines_that_mimic_file_headers_do_not_reset_state() {
+        // A deleted `-- old` is `--- old` in the patch and an added `++ new`
+        // is `+++ new`. Followed by the next `@@`, they look like a file
+        // header triple. Hunk counts prove they are body, so the comment
+        // opened in hunk 1's context must still hold in hunk 2.
+        let code = "--- a/x.ts\n+++ b/x.ts\n@@ -1,2 +1,2 @@\n /* opened in context\n--- old\n+++ new\n\
+                    @@ -9,1 +9,1 @@\n-x\n+const shouldBeComment = 1;\n";
+        let ansi = highlight_unified_diff(
+            "typescript",
+            code,
+            DiffStyle::MarkerFg,
+            &default_colors(),
+            CodeTheme::Mdstream,
+            false,
+        )
+        .unwrap();
+        assert_eq!(strip_ansi(&ansi), code);
+        let row = ansi
+            .split('\n')
+            .find(|row| strip_ansi(row).starts_with("+const"))
+            .unwrap();
+        assert!(
+            !row.contains("\x1b[38;2;123;167;255m"),
+            "line inside the still-open comment must not be live code: {:?}",
+            row
+        );
+    }
+
+    /// One TS file section: a context `/*` on the first line, `pad` context
+    /// lines, a context `*/`, then a change. Correct rendering: live code.
+    fn comment_spanning_file(name: &str, pad: usize) -> String {
+        let mut body = vec![" /* opens here".to_owned()];
+        body.extend((0..pad).map(|i| format!(" const pad{i} = {i};")));
+        body.extend([" */".to_owned(), "-const a = 1;".to_owned()]);
+        body.push("+const b = 2;".to_owned());
+        let count = body.len() - 1;
+        format!(
+            "--- a/{name}\n+++ b/{name}\n@@ -1,{count} +1,{count} @@\n{}\n",
+            body.join("\n")
+        )
+    }
+
+    fn render_ts(code: &str, budget: usize) -> String {
+        highlight_unified_diff_with_budget(
+            "typescript",
+            code,
+            DiffStyle::MarkerFg,
+            &default_colors(),
+            CodeTheme::Mdstream,
+            false,
+            budget,
+        )
+        .unwrap()
+    }
+
+    /// Whether each `+const b` row is live code (keyword blue), in order.
+    fn added_rows_are_code(ansi: &str) -> Vec<bool> {
+        ansi.split('\n')
+            .filter(|row| strip_ansi(row).starts_with("+const b"))
+            .map(|row| row.contains("\x1b[38;2;123;167;255m"))
+            .collect()
+    }
+
+    #[test]
+    fn over_budget_file_renders_exactly_as_without_continuity() {
+        // Regression: the budget used to stop feeding part-way. The `/*` was
+        // fed and its `*/` was not, so the changed line rendered as comment,
+        // worse than never feeding context at all. Over budget must now be
+        // byte-identical to the no-continuity rendering, and correct here.
+        let code = comment_spanning_file("x.ts", CONTEXT_LINE_BUDGET + 400);
+        let ansi = render_ts(&code, CONTEXT_LINE_BUDGET);
+        assert_eq!(strip_ansi(&ansi), code);
+        assert_eq!(ansi, render_ts(&code, 0));
+        assert_eq!(added_rows_are_code(&ansi), vec![true]);
+    }
+
+    #[test]
+    fn budget_boundary_is_all_or_nothing() {
+        // The fixture's fed context is the `/*` line, `pad` filler lines and
+        // the `*/` line: pad + 2 lines, all fed (both streams emit later).
+        // Fed in full or not at all, the comment is closed or never seen, so
+        // both render the `+` row as code with identical bytes. A feed that
+        // stops anywhere before `*/` leaves the comment open and the row
+        // comment-colored. So at the exact boundary, on both sides of it, the
+        // output must equal the reference.
+        let pad = 500;
+        let fed = pad + 2;
+        let code = comment_spanning_file("x.ts", pad);
+        let reference = render_ts(&code, 0);
+        assert_eq!(render_ts(&code, usize::MAX), reference);
+        assert_eq!(render_ts(&code, fed), reference, "exactly fits");
+        assert_eq!(render_ts(&code, fed - 1), reference, "one short");
+        assert_eq!(added_rows_are_code(&reference), vec![true]);
+        // Premise: the partial-feed shape (closer never lexed) is visible.
+        let cut = code.replacen(" */\n", " const cut = 0;\n", 1);
+        assert_eq!(
+            added_rows_are_code(&render_ts(&cut, usize::MAX)),
+            vec![false]
+        );
+    }
+
+    #[test]
+    fn within_budget_file_is_fed_in_full() {
+        let code = comment_spanning_file("x.ts", CONTEXT_LINE_BUDGET - 10);
+        assert_eq!(
+            added_rows_are_code(&render_ts(&code, CONTEXT_LINE_BUDGET)),
+            vec![true]
+        );
+        // And the feed is live: an unclosed comment does reach the `+` line.
+        let open = "--- a/x.ts\n+++ b/x.ts\n@@ -1,2 +1,2 @@\n /* never closed\n-a\n+const b = 2;\n";
+        assert_eq!(
+            added_rows_are_code(&render_ts(open, CONTEXT_LINE_BUDGET)),
+            vec![false]
+        );
+        assert_eq!(added_rows_are_code(&render_ts(open, 0)), vec![true]);
+    }
+
+    #[test]
+    fn budget_is_admitted_per_file() {
+        // A huge first file is skipped whole; a small file after it still gets
+        // continuity, because files are independent sections.
+        let small_open =
+            "--- a/s.ts\n+++ b/s.ts\n@@ -1,2 +1,2 @@\n /* never closed\n-a\n+const b = 2;\n";
+        let code = format!(
+            "{}{small_open}",
+            comment_spanning_file("big.ts", CONTEXT_LINE_BUDGET + 400)
+        );
+        let ansi = render_ts(&code, CONTEXT_LINE_BUDGET);
+        assert_eq!(strip_ansi(&ansi), code);
+        // big.ts: unfed, so `*/`-closed comment is irrelevant and the row is
+        // code. s.ts: fed, so the unclosed comment holds and the row is not.
+        assert_eq!(added_rows_are_code(&ansi), vec![true, false]);
+    }
+
+    #[test]
+    fn admit_files_is_all_or_nothing_in_patch_order() {
+        use Role::*;
+        // Section 0 (pre-header): 1 fed line. File 1: 3. File 2: 2.
+        let roles = [Body, FileStart, Body, Body, Body, FileStart, Body, Body];
+        let fed = [true, false, true, true, true, false, true, true];
+        assert_eq!(admit_files(&roles, &fed, 6), vec![true, true, true]);
+        assert_eq!(admit_files(&roles, &fed, 4), vec![true, true, false]);
+        assert_eq!(admit_files(&roles, &fed, 3), vec![true, false, true]);
+        assert_eq!(admit_files(&roles, &fed, 0), vec![false, false, false]);
+    }
+
+    #[test]
+    fn line_roles_follow_hunk_counts() {
+        let code = "diff --git a/x b/x\nindex 1..2\n--- a/x\n+++ b/x\n@@ -1,2 +1 @@\n--- body\n ctx\n@@ -9 +8,2 @@\n+++ body\n+y\n z\n";
+        let lines: Vec<&str> = code.split_inclusive('\n').collect();
+        use Role::*;
+        assert_eq!(
+            line_roles(&lines),
+            vec![
+                // `---` after `diff --git` resets again: harmless, no lexing yet.
+                FileStart, Structure, FileStart, Structure, Structure, Body, Body, Structure, Body,
+                Body, Body
+            ]
+        );
+        assert_eq!(hunk_counts("@@ -1,2 +3 @@ fn x()"), Some((2, 1)));
+        assert_eq!(hunk_counts("@@"), None);
     }
 
     #[test]

@@ -4,6 +4,22 @@ All notable changes to `mdstream` are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-11-16
+
+### Added
+
+- `php-source` language token (case-insensitive, trimmed) for the highlight server and `RawCodeHighlighter`. Syntect's `php` grammar starts in HTML mode and lexes PHP only after a `<?php` / `<?` tag, so a mid-file slice or a diff hunk rendered as one flat color. `php-source` selects the bundled inner `PHP Source` grammar (scope `source.php`), which starts in PHP mode. Measured on a mid-file slice: 1 distinct foreground with `php`, 7 with `php-source`, same line count. Older servers resolve `php-source` to plain text, so clients fail closed on version skew.
+
+### Changed
+
+- Behavior change, `mode:"unified-diff"`: context lines now carry lexical state into the changed lines after them. They are still printed verbatim, but they are lexed (output discarded) so a `/*` or `<?php` on a context line affects the `-`/`+` lines below it. Before, a `+` line inside a comment opened on a context line was colored as live code, and a PHP `+` line after a context `<?php` was flat.
+  - Only lines inside a hunk are lexed. The preamble (`diff --git`, `index`) and the `---` / `+++` headers never reach a lexer, so a quote in a file name cannot poison the first hunk.
+  - Each file section of a multi-file patch starts with fresh state.
+  - Hunk extent comes from the `@@ -a,b +c,d @@` counts, so a deleted `-- x` or added `++ y` line (`--- x` / `+++ y` in the patch) is always body, never a file header. A bare `@@` with no counts falls back to detecting the `---` / `+++` / `@@` header triple.
+- Cost is bounded. A context line is lexed for a stream only if that stream emits a changed line later in the same file, and while both streams share state the line is lexed once and the state is copied. Context is admitted per file section, greedily in patch order and all or nothing, up to 1000 lines per request. A file over the budget is not fed at all, and its output is byte-identical to 0.3.8. It never stops part-way, because a feed that stopped between a `/*` and its `*/` would color later changed lines as comment. Measured: no added time over budget, and about +110 ms for a patch just under it (fresh server per request, spawn included).
+- `LineHighlighter` keeps syntect's `ParseState` and scope path directly, replacing the `HighlightLines` wrapper, so a stream can advance over a line without styling it. Raw mode (`RawCodeHighlighter`) is unchanged.
+- Companion host change: a highlight-server client should treat a request timeout as a failure of that one request (respawn the server), not as a reason to disable highlighting for the session. The minimal-agent CLI fix ships separately.
+
 ## [0.3.8] - 2026-11-15
 
 ### Added

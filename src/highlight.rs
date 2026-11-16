@@ -1,8 +1,8 @@
 use std::sync::OnceLock;
 
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter, Theme, ThemeSet};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use syntect::util::as_24_bit_terminal_escaped;
 
 use crate::theme::{CodeTheme, load_theme_set};
@@ -87,12 +87,7 @@ pub(crate) fn syntect_assets() -> &'static SyntectAssets {
 }
 
 pub(crate) fn make_highlighter(language: &str, code_theme: CodeTheme) -> HighlightLines<'static> {
-    let assets = syntect_assets();
-    let syntax = assets
-        .syntax_set
-        .find_syntax_by_token(normalize_syntax_token(language))
-        .unwrap_or_else(|| assets.syntax_set.find_syntax_plain_text());
-    HighlightLines::new(syntax, assets.theme(code_theme))
+    HighlightLines::new(find_syntax(language), syntect_assets().theme(code_theme))
 }
 
 /// A persistent per-stream highlighter for dual-stream diff composition.
@@ -101,40 +96,101 @@ pub(crate) fn make_highlighter(language: &str, code_theme: CodeTheme) -> Highlig
 /// comment on the deleted side cannot poison the added side. `highlight_line`
 /// returns the escaped content for one logical line, without the trailing
 /// newline (the caller appends framing and the line ending).
+///
+/// Unlike [`HighlightLines`], the lexical state is held as plain comparable,
+/// clonable data (`ParseState` plus the scope path), so a stream can be
+/// advanced over a line without styling it ([`Self::advance`]), and two
+/// streams in the same state can share one lex ([`Self::copy_state_from`]).
 pub(crate) struct LineHighlighter {
-    highlighter: HighlightLines<'static>,
+    highlighter: Highlighter<'static>,
+    parse_state: ParseState,
+    /// The scope path after the last lexed line. The source of truth.
+    path: ScopeStack,
+    /// Style cache for `path`, rebuilt lazily after `advance` or a copy.
+    highlight_state: Option<HighlightState>,
     show_background: bool,
 }
 
 impl LineHighlighter {
     pub(crate) fn new(language: &str, code_theme: CodeTheme, show_background: bool) -> Self {
         Self {
-            highlighter: make_highlighter(language, code_theme),
+            highlighter: Highlighter::new(syntect_assets().theme(code_theme)),
+            parse_state: ParseState::new(find_syntax(language)),
+            path: ScopeStack::new(),
+            highlight_state: None,
             show_background,
         }
     }
 
     pub(crate) fn highlight_line(&mut self, content: &str) -> Result<String, syntect::Error> {
-        let assets = syntect_assets();
-        let mut parse_line = String::with_capacity(content.len() + 1);
-        parse_line.push_str(content);
-        parse_line.push('\n');
-        let regions = self
-            .highlighter
-            .highlight_line(&parse_line, &assets.syntax_set)?;
+        let parse_line = with_newline(content);
+        let ops = self
+            .parse_state
+            .parse_line(&parse_line, &syntect_assets().syntax_set)?;
+        let highlighter = &self.highlighter;
+        let path = &self.path;
+        let state = self
+            .highlight_state
+            .get_or_insert_with(|| HighlightState::new(highlighter, path.clone()));
+        let regions: Vec<_> =
+            HighlightIterator::new(state, &ops, &parse_line, highlighter).collect();
+        self.path = state.path.clone();
         let escaped = as_24_bit_terminal_escaped(&regions, self.show_background);
         Ok(escaped.trim_end_matches('\n').to_owned())
     }
+
+    /// Lexes `content` to carry state forward, without styling it.
+    pub(crate) fn advance(&mut self, content: &str) -> Result<(), syntect::Error> {
+        let ops = self
+            .parse_state
+            .parse_line(&with_newline(content), &syntect_assets().syntax_set)?;
+        for (_, op) in &ops {
+            self.path.apply(op)?;
+        }
+        self.highlight_state = None;
+        Ok(())
+    }
+
+    /// Whether both streams would lex and style the next line identically.
+    pub(crate) fn same_state(&self, other: &Self) -> bool {
+        self.path == other.path && self.parse_state == other.parse_state
+    }
+
+    /// Takes over `other`'s lexical state. Both streams must share a language
+    /// and theme, which the single caller (`highlight_unified_diff`)
+    /// guarantees.
+    pub(crate) fn copy_state_from(&mut self, other: &Self) {
+        self.parse_state = other.parse_state.clone();
+        self.path = other.path.clone();
+        self.highlight_state = None;
+    }
+}
+
+fn with_newline(content: &str) -> String {
+    let mut line = String::with_capacity(content.len() + 1);
+    line.push_str(content);
+    line.push('\n');
+    line
+}
+
+fn find_syntax(language: &str) -> &'static SyntaxReference {
+    let assets = syntect_assets();
+    assets
+        .syntax_set
+        .find_syntax_by_token(normalize_syntax_token(language))
+        .unwrap_or_else(|| assets.syntax_set.find_syntax_plain_text())
 }
 
 fn normalize_syntax_token(language: &str) -> &str {
-    if matches!(
-        language.trim().to_ascii_lowercase().as_str(),
-        "typescript" | "ts" | "mts" | "cts" | "tsx"
-    ) {
-        "javascript"
-    } else {
-        language
+    match language.trim().to_ascii_lowercase().as_str() {
+        "typescript" | "ts" | "mts" | "cts" | "tsx" => "javascript",
+        // Syntect's `PHP` grammar starts in HTML mode and lexes PHP only after
+        // an opening `<?php` / `<?` tag, so a mid-file slice or a diff hunk
+        // renders as flat HTML text. `PHP Source` is the bundled inner grammar
+        // (scope `source.php`) that starts in PHP mode. `php-source` is the
+        // stable client-facing token for it.
+        "php-source" => "PHP Source",
+        _ => language,
     }
 }
 
@@ -286,6 +342,37 @@ mod tests {
             "context line must stay base-colored: {}",
             lines[3]
         );
+    }
+
+    fn distinct_foregrounds(ansi: &str) -> usize {
+        let fg = regex::Regex::new(r"\x1b\[38;2;[0-9;]+m").unwrap();
+        fg.find_iter(ansi)
+            .map(|m| m.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
+    #[test]
+    fn php_source_token_highlights_untagged_php() {
+        // Regression: `php` selects the HTML-embedding grammar, so a mid-file
+        // slice with no `<?php` tag rendered as one flat color. `php-source`
+        // selects the inner grammar that starts in PHP mode.
+        let highlighter = RawCodeHighlighter::new(CodeTheme::Mdstream, false);
+        let code = "    public function foo($x) {\n        return $this->bar[$x] ?? \"none\"; // c\n    }\n";
+
+        let flat = highlighter.highlight("php", code).unwrap();
+        let source = highlighter.highlight("php-source", code).unwrap();
+        let cased = highlighter.highlight(" PHP-Source ", code).unwrap();
+
+        assert_eq!(strip_ansi(&source), code);
+        assert_eq!(source.split('\n').count(), flat.split('\n').count());
+        assert_eq!(
+            distinct_foregrounds(&flat),
+            1,
+            "premise: `php` is flat here"
+        );
+        assert!(distinct_foregrounds(&source) >= 4, "{source:?}");
+        assert_eq!(cased, source);
     }
 
     #[test]
